@@ -29,6 +29,9 @@ jobs:
 
       - name: Build (vite/electron)
         run: npm run build
+      
+      - name: Rebuild native modules (better-sqlite3)
+        run: npx electron-builder install-app-deps
 
       # Сборка установщиков. Должен быть electron-builder в devDependencies и скрипт dist.
       - name: Dist
