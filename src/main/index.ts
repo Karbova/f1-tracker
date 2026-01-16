@@ -5,7 +5,7 @@ import icon from "../../resources/icon.png?asset";
 import { initDb, db } from "./db";
 
 // ---------- helpers ----------
-function registerHandle<T = any>(
+function registerHandle(
   channel: string,
   handler: Parameters<typeof ipcMain.handle>[1]
 ) {
