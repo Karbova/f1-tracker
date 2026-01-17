@@ -34,19 +34,9 @@
     ],
     "publish": [
       {
-        "provider": "github",
-        "owner": "OWNER",
-        "repo": "REPO"
+        "provider": "github"
       }
     ],
-    "appId": "com.yourname.f1tracker",
-    "productName": "F1 Tracker",
-    "publish": [
-      { "provider": "github" }
-    ],
-    "win": {
-      "target": "nsis"
-    },
     "win": {
       "target": [
         {
@@ -67,6 +57,7 @@
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
     "better-sqlite3": "^12.6.0",
+    "electron-log": "^5.4.3",
     "electron-updater": "^6.7.3",
     "react-router-dom": "^7.12.0"
   },
