@@ -1525,7 +1525,7 @@ function Column(props: {
         props.setDragOver(props.sessionKey);
       }}
       onDragLeave={() => {
-        props.setDragOver((prev) => (prev === props.sessionKey ? null : prev));
+        if (isOver) props.setDragOver(null);
       }}
       onDrop={(e) => {
         e.preventDefault();
