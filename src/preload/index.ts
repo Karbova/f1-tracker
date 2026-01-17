@@ -13,6 +13,11 @@ const api = {
   calendarList: () => ipcRenderer.invoke("calendar:list"),
   calendarCreate: (payload: any) => ipcRenderer.invoke("calendar:create", payload),
   calendarDelete: (id: number) => ipcRenderer.invoke("calendar:delete", id),
+  getF1Schedule: (season?: string | number) => ipcRenderer.invoke("f1:schedule", season ?? "current"),
+  rescheduleNotifications: () => ipcRenderer.invoke("tasks:rescheduleNotifications"),
+  listCalendar: () => ipcRenderer.invoke("calendar:list"),
+  createCalendar: (payload: any) => ipcRenderer.invoke("calendar:create", payload),
+  deleteCalendar: (id: number) => ipcRenderer.invoke("calendar:delete", id),
 };
 
 if (process.contextIsolated) {

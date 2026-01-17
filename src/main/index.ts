@@ -1,8 +1,11 @@
-import { app, shell, BrowserWindow, ipcMain } from "electron";
+import { app, shell, BrowserWindow, ipcMain, Notification } from "electron";
 import { join } from "path";
 import { electronApp, optimizer, is } from "@electron-toolkit/utils";
 import icon from "../../resources/icon.png?asset";
 import { initDb, db } from "./db";
+import { autoUpdater } from "electron-updater";
+import log from "electron-log";
+
 
 // ---------- helpers ----------
 function registerHandle(
@@ -23,6 +26,45 @@ function clampInt(v: any, min: number, max: number) {
   const n = Number(v);
   if (!Number.isFinite(n)) return min;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+autoUpdater.logger = log;
+(autoUpdater.logger as any).transports.file.level = "info";
+
+// чтобы на Windows искал latest.yml в GitHub Releases
+autoUpdater.autoDownload = true;
+
+const notifTimers = new Map<number, NodeJS.Timeout>();
+
+function clearNotif(id: number) {
+  const t = notifTimers.get(id);
+  if (t) clearTimeout(t);
+  notifTimers.delete(id);
+}
+
+function scheduleDeadlineNotif(task: any) {
+  // ожидаем: task.id, task.title, task.deadline (YYYY-MM-DD)
+  clearNotif(Number(task.id));
+
+  if (!task.deadline) return;
+  if (task.status === "finish" || task.status === "dnf") return;
+
+  // напоминание в 10:00 утра в день дедлайна (можно поменять)
+  const target = new Date(`${task.deadline}T10:00:00`);
+  const ms = target.getTime() - Date.now();
+  if (ms <= 0) return;
+
+  notifTimers.set(
+    Number(task.id),
+    setTimeout(() => {
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "⏰ Дедлайн сегодня",
+          body: task.title,
+        }).show();
+      }
+      clearNotif(Number(task.id));
+    }, ms)
+  );
 }
 
 function toISO(d: Date) {
@@ -108,10 +150,13 @@ function createWindow(): void {
 // ---------- main ----------
 app.whenReady().then(() => {
   electronApp.setAppUserModelId("com.electron");
+  autoUpdater.checkForUpdatesAndNotify();
 
   app.on("browser-window-created", (_, window) => {
     optimizer.watchWindowShortcuts(window);
   });
+
+  
 
   // DB init (создаёт таблицы / миграции)
   initDb();
@@ -121,6 +166,10 @@ app.whenReady().then(() => {
   // ------------------------------------------------------------
   registerHandle("tasks:list", async () => {
     return db.prepare("SELECT * FROM tasks ORDER BY id DESC").all();
+  });
+
+  ipcMain.handle("update:check", async () => {
+    return await autoUpdater.checkForUpdates();
   });
 
   registerHandle("tasks:create", async (_event, payload: any) => {
@@ -143,8 +192,17 @@ app.whenReady().then(() => {
          VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0)`
       )
       .run(title, session_type, status, laps_total, laps_done, now, deadline);
+      const created = db.prepare("SELECT * FROM tasks WHERE id = ?").get(info.lastInsertRowid);
+scheduleDeadlineNotif(created);
 
     return { id: Number(info.lastInsertRowid) };
+  });
+
+  registerHandle("tasks:rescheduleNotifications", async () => {
+    // перечитаем все задачи и поставим таймеры заново
+    const all = db.prepare("SELECT * FROM tasks").all();
+    for (const t of all) scheduleDeadlineNotif(t);
+    return { ok: true };
   });
 
   registerHandle("tasks:update", async (_event, payload: any) => {
@@ -184,6 +242,8 @@ app.whenReady().then(() => {
        SET title = ?, session_type = ?, status = ?, laps_total = ?, laps_done = ?, deadline = ?
        WHERE id = ?`
     ).run(title, session_type, status, laps_total, laps_done, deadline, id);
+    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(payload.id);
+scheduleDeadlineNotif(updated);
 
     return { ok: true };
   });
@@ -206,6 +266,7 @@ app.whenReady().then(() => {
     db.prepare(
       `UPDATE tasks
        SET status = 'finish',
+           session_type = 'parc',
            finished_at = ?,
            points_base = ?,
            points_bonus = 0,
@@ -213,6 +274,7 @@ app.whenReady().then(() => {
            points_total = ?
        WHERE id = ?`
     ).run(finishedAt, base, penalty, total, id);
+    clearNotif(id);
 
     return { ok: true };
   });
@@ -227,6 +289,7 @@ app.whenReady().then(() => {
     db.prepare(
       `UPDATE tasks
        SET status = 'dnf',
+           session_type = 'parc',
            finished_at = ?,
            points_base = 0,
            points_bonus = 0,
@@ -234,12 +297,46 @@ app.whenReady().then(() => {
            points_total = ?
        WHERE id = ?`
     ).run(finishedAt, penalty, penalty, id);
+    clearNotif(id);
 
     return { ok: true };
   });
 
   registerHandle("tasks:delete", async (_event, id: number) => {
     db.prepare("DELETE FROM tasks WHERE id = ?").run(id);
+    clearNotif(id);
+    return { ok: true };
+
+  });
+
+  registerHandle("calendar:list", async () => {
+    return db.prepare("SELECT * FROM calendar_events ORDER BY start_date DESC, start_time DESC, id DESC").all();
+  });
+  
+  registerHandle("calendar:create", async (_e, payload: any) => {
+    const now = new Date().toISOString();
+  
+    const info = db
+      .prepare(
+        `INSERT INTO calendar_events
+          (title, start_date, start_time, end_time, location, notes, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        payload.title,
+        payload.start_date,
+        payload.start_time ?? null,
+        payload.end_time ?? null,
+        payload.location ?? null,
+        payload.notes ?? null,
+        now
+      );
+  
+    return db.prepare("SELECT * FROM calendar_events WHERE id = ?").get(info.lastInsertRowid);
+  });
+  
+  registerHandle("calendar:delete", async (_e, id: number) => {
+    db.prepare("DELETE FROM calendar_events WHERE id = ?").run(id);
     return { ok: true };
   });
 
@@ -256,7 +353,7 @@ app.whenReady().then(() => {
       "https://api.jolpi.ca/ergast/f1/current/next.json",
       "https://ergast.com/api/f1/current/next.json",
     ];
-
+    
     let lastErr: any = null;
 
     for (const url of endpoints) {
@@ -282,6 +379,42 @@ app.whenReady().then(() => {
     }
 
     throw new Error(`Failed to fetch next GP: ${String(lastErr?.message ?? lastErr)}`);
+  });
+
+  type F1Race = {
+    round: number;
+    raceName: string;
+    circuitName: string;
+    locality: string;
+    country: string;
+    date: string;        // YYYY-MM-DD
+    dateTimeISO: string; // YYYY-MM-DDTHH:MM:SSZ
+  };
+  
+  registerHandle("f1:schedule", async (_event, season: string | number = "current") => {
+    const url = `https://api.jolpi.ca/ergast/f1/${season}.json`;
+  
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  
+    const data = await res.json();
+    const races = data?.MRData?.RaceTable?.Races ?? [];
+  
+    const out: F1Race[] = races.map((r: any) => {
+      const date = String(r.date);
+      const time = r.time ? String(r.time) : "00:00:00Z";
+      return {
+        round: Number(r.round),
+        raceName: String(r.raceName || "Grand Prix"),
+        circuitName: String(r?.Circuit?.circuitName || ""),
+        locality: String(r?.Circuit?.Location?.locality || ""),
+        country: String(r?.Circuit?.Location?.country || ""),
+        date,
+        dateTimeISO: `${date}T${time}`,
+      };
+    });
+  
+    return out;
   });
 
   // create window

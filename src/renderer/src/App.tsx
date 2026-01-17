@@ -31,7 +31,7 @@ type F1Race = {
 };
 
 type CalendarEvent = {
-  id: string;
+  id: number;
   title: string;
   date: string; // YYYY-MM-DD
   startTime?: string;
@@ -39,6 +39,13 @@ type CalendarEvent = {
   location?: string;
   notes?: string;
   createdAt: string;
+};
+
+type PointsRules = {
+  base: Record<SessionType, number>;
+  latePenaltyAfterDays: number; // например 3
+  latePenaltyPoints: number; // например -5
+  dnfPenaltyPoints: number; // например -3
 };
 
 // ---- window.api typing (минимально) ----
@@ -51,8 +58,18 @@ declare global {
       deleteTask: (id: number) => Promise<any>;
       finishTask: (id: number) => Promise<any>;
       dnfTask: (id: number) => Promise<any>;
+
       getNextGp: () => Promise<NextGp>;
       getF1Schedule: (season?: string | number) => Promise<F1Race[]>;
+
+      rescheduleNotifications: () => Promise<any>;
+
+      listCalendar: () => Promise<CalendarEvent[]>;
+      createCalendar: (payload: any) => Promise<CalendarEvent>;
+      deleteCalendar: (id: number) => Promise<any>;
+
+      // опционально (если добавишь в preload/main)
+      setPointsRules?: (rules: PointsRules) => Promise<any>;
     };
   }
 }
@@ -61,6 +78,12 @@ function clampInt(v: any, min: number, max: number) {
   const n = Number(v);
   if (!Number.isFinite(n)) return min;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function clampNum(v: any, min: number, max: number) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
 }
 
 function toYMD(d: Date) {
@@ -149,22 +172,96 @@ function statusText(st: Status) {
 
 // localStorage keys
 const LS_PAGE = "f1_page";
-const LS_EVENTS = "f1_calendar_events";
 const LS_GP_CACHE = "f1_next_gp_cache_v2";
 const LS_SHOW_PARC = "f1_show_parc";
 const LS_F1_SCHEDULE_CACHE = "f1_schedule_cache_v1";
 
-type Page = "tracker" | "calendar";
+// appearance/settings keys
+const LS_BG_IMAGE = "f1_bg_image_v1"; // dataURL
+const LS_BG_DIM = "f1_bg_dim_v1"; // 0..0.85
+const LS_FONT_SCALE = "f1_font_scale_v1"; // 0.85..1.25
+const LS_POINTS_RULES = "f1_points_rules_v1";
+
+// drag & drop key
+const DND_TASK = "application/x-f1-task";
+
+type Page = "tracker" | "calendar" | "settings";
+
+const DEFAULT_POINTS_RULES: PointsRules = {
+  base: {
+    practice: 1,
+    qualifying: 2,
+    sprint: 3,
+    race: 5,
+    pit: 1,
+    parc: 0,
+  },
+  latePenaltyAfterDays: 3,
+  latePenaltyPoints: -5,
+  dnfPenaltyPoints: -3,
+};
+
+function safeParseJSON<T>(raw: string | null): T | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
 
 export default function App() {
   // -------- navigation --------
   const [page, setPage] = useState<Page>(() => {
     const saved = localStorage.getItem(LS_PAGE);
-    return saved === "calendar" ? "calendar" : "tracker";
+    return saved === "calendar" || saved === "settings" ? (saved as Page) : "tracker";
   });
   useEffect(() => {
     localStorage.setItem(LS_PAGE, page);
   }, [page]);
+
+  // -------- appearance settings --------
+  const [bgImage, setBgImage] = useState<string>(() => localStorage.getItem(LS_BG_IMAGE) || "");
+  const [bgDim, setBgDim] = useState<number>(() => {
+    const v = Number(localStorage.getItem(LS_BG_DIM) || "0.35");
+    return clampNum(v, 0, 0.85);
+  });
+  const [fontScale, setFontScale] = useState<number>(() => {
+    const v = Number(localStorage.getItem(LS_FONT_SCALE) || "1");
+    return clampNum(v, 0.85, 1.25);
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_BG_IMAGE, bgImage || "");
+      localStorage.setItem(LS_BG_DIM, String(bgDim));
+      localStorage.setItem(LS_FONT_SCALE, String(fontScale));
+    } catch {
+      // ignore
+    }
+  }, [bgImage, bgDim, fontScale]);
+
+  // -------- points rules settings --------
+  const [pointsRules, setPointsRules] = useState<PointsRules>(() => {
+    const stored = safeParseJSON<PointsRules>(localStorage.getItem(LS_POINTS_RULES));
+    if (!stored?.base) return DEFAULT_POINTS_RULES;
+    return {
+      base: { ...DEFAULT_POINTS_RULES.base, ...(stored.base || {}) },
+      latePenaltyAfterDays: clampInt(stored.latePenaltyAfterDays, 0, 365),
+      latePenaltyPoints: clampInt(stored.latePenaltyPoints, -999, 999),
+      dnfPenaltyPoints: clampInt(stored.dnfPenaltyPoints, -999, 999),
+    };
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_POINTS_RULES, JSON.stringify(pointsRules));
+    } catch {
+      // ignore
+    }
+    // если добавишь IPC — будет применяться в main
+    window.api.setPointsRules?.(pointsRules);
+  }, [pointsRules]);
 
   // -------- tasks (SQLite) --------
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -179,6 +276,9 @@ export default function App() {
     localStorage.setItem(LS_SHOW_PARC, showParc ? "1" : "0");
   }, [showParc]);
 
+  // drag over highlight
+  const [dragOver, setDragOver] = useState<SessionType | null>(null);
+
   async function reloadTasks() {
     setLoadingTasks(true);
     try {
@@ -188,6 +288,11 @@ export default function App() {
       setLoadingTasks(false);
     }
   }
+
+  useEffect(() => {
+    // пересобрать уведомления при старте (если у тебя уже есть)
+    window.api.rescheduleNotifications?.();
+  }, []);
 
   useEffect(() => {
     reloadTasks();
@@ -223,7 +328,6 @@ export default function App() {
   async function fetchNextGp() {
     try {
       setGpError(null);
-
       const next = await window.api.getNextGp();
       setNextGp(next);
       saveF1Cache(next);
@@ -240,7 +344,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // live countdown tick
   useEffect(() => {
     const t = setInterval(() => setGpTick((x) => x + 1), 1000);
     return () => clearInterval(t);
@@ -290,17 +393,27 @@ export default function App() {
     const nextDone = clampInt(task.laps_done + 1, 0, task.laps_total);
     const nextStatus: Status = "progress";
 
-    // локально (быстро)
     setTasks((prev) =>
       prev.map((t) => (t.id === task.id ? { ...t, laps_done: nextDone, status: nextStatus } : t))
     );
 
-    // в БД
     await window.api.updateTask({
       id: task.id,
       laps_done: nextDone,
       status: nextStatus,
     });
+  }
+
+  // move task between sessions via drag&drop
+  async function moveTaskToSession(id: number, to: SessionType) {
+    const task = tasks.find((t) => t.id === id);
+    if (!task) return;
+
+    const done = task.status === "finish" || task.status === "dnf";
+    if (done && to !== "parc") return;
+
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, session_type: to } : t)));
+    await window.api.updateTask({ id, session_type: to });
   }
 
   // -------- title editing (fix 1-char bug) --------
@@ -374,26 +487,27 @@ export default function App() {
     return map;
   }, [tasks]);
 
-  // -------- calendar state (localStorage) --------
-  const [events, setEvents] = useState<CalendarEvent[]>(() => {
+  // -------- calendar state (SQLite) --------
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+  const [calErr, setCalErr] = useState<string | null>(null);
+
+  async function reloadEvents() {
+    setLoadingEvents(true);
     try {
-      const raw = localStorage.getItem(LS_EVENTS);
-      if (!raw) return [];
-      const arr = JSON.parse(raw);
-      if (!Array.isArray(arr)) return [];
-      return arr as CalendarEvent[];
-    } catch {
-      return [];
+      setCalErr(null);
+      const rows = await window.api.listCalendar();
+      setEvents(rows || []);
+    } catch (e: any) {
+      setCalErr(e?.message ? String(e.message) : "Calendar load failed");
+    } finally {
+      setLoadingEvents(false);
     }
-  });
+  }
 
   useEffect(() => {
-    try {
-      localStorage.setItem(LS_EVENTS, JSON.stringify(events));
-    } catch {
-      // ignore
-    }
-  }, [events]);
+    reloadEvents();
+  }, []);
 
   // -------- F1 schedule (Calendar only) --------
   const [f1Races, setF1Races] = useState<F1Race[]>(() => {
@@ -416,7 +530,10 @@ export default function App() {
       const races = await window.api.getF1Schedule("current");
       setF1Races(races || []);
       try {
-        localStorage.setItem(LS_F1_SCHEDULE_CACHE, JSON.stringify({ ts: Date.now(), data: races || [] }));
+        localStorage.setItem(
+          LS_F1_SCHEDULE_CACHE,
+          JSON.stringify({ ts: Date.now(), data: races || [] })
+        );
       } catch {}
     } catch (e: any) {
       setF1Err(e?.message ? String(e.message) : "Failed to load F1 schedule");
@@ -513,22 +630,21 @@ export default function App() {
   const [evLoc, setEvLoc] = useState("");
   const [evNotes, setEvNotes] = useState("");
 
-  function addEvent() {
+  async function addEvent() {
     const t = evTitle.trim();
     if (!t) return;
 
-    const newEv: CalendarEvent = {
-      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    const created = await window.api.createCalendar({
       title: t,
-      date: selectedDay,
-      startTime: evStart || undefined,
-      endTime: evEnd || undefined,
-      location: evLoc.trim() || undefined,
-      notes: evNotes.trim() || undefined,
-      createdAt: new Date().toISOString(),
-    };
+      start_date: selectedDay,
+      start_time: evStart || null,
+      end_time: evEnd || null,
+      location: evLoc.trim() || null,
+      notes: evNotes.trim() || null,
+    });
 
-    setEvents((prev) => [newEv, ...prev]);
+    setEvents((prev) => [created, ...prev]);
+
     setEvTitle("");
     setEvStart("");
     setEvEnd("");
@@ -536,7 +652,8 @@ export default function App() {
     setEvNotes("");
   }
 
-  function deleteEvent(id: string) {
+  async function deleteEvent(id: number) {
+    await window.api.deleteCalendar(id);
     setEvents((prev) => prev.filter((e) => e.id !== id));
   }
 
@@ -554,224 +671,475 @@ export default function App() {
 
   // ---------- UI ----------
   const isTracker = page === "tracker";
+  const isCalendar = page === "calendar";
+
+  // ---------- dynamic styles (font scale + background) ----------
+  const styles = useMemo(() => {
+    const fs = (n: number) => Math.round(n * fontScale);
+
+    return {
+      ...baseStyles,
+      app: {
+        ...baseStyles.app,
+        position: "relative",
+        backgroundImage: bgImage ? `url(${bgImage})` : undefined,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+      },
+      bgOverlay: {
+        position: "absolute",
+        inset: 0,
+        background: `rgba(0,0,0,${bgImage ? bgDim : 0})`,
+        pointerEvents: "none",
+        zIndex: 0,
+      },
+      content: { position: "relative", zIndex: 1 },
+
+      h1: { ...baseStyles.h1, fontSize: fs(48) },
+      sub: { ...baseStyles.sub, fontSize: fs(18) },
+
+      tab: { ...baseStyles.tab, fontSize: fs(14) },
+
+      gpTitle: { ...baseStyles.gpTitle, fontSize: fs(16) },
+      gpName: { ...baseStyles.gpName, fontSize: fs(18) },
+      gpLoc: { ...baseStyles.gpLoc, fontSize: fs(13) },
+      gpCountdown: { ...baseStyles.gpCountdown, fontSize: fs(15) },
+      gpCountdownSmall: { ...baseStyles.gpCountdownSmall, fontSize: fs(11) },
+
+      input: { ...baseStyles.input, fontSize: fs(15) },
+      select: { ...baseStyles.select, fontSize: fs(15) },
+      lapsInput: { ...baseStyles.lapsInput, fontSize: fs(15) },
+      addBtn: { ...baseStyles.addBtn, fontSize: fs(16) },
+
+      chip: { ...baseStyles.chip, fontSize: fs(13) },
+      chipMuted: { ...baseStyles.chipMuted, fontSize: fs(13) },
+
+      columnTitle: { ...baseStyles.columnTitle, fontSize: fs(22) },
+      columnHint: { ...baseStyles.columnHint, fontSize: fs(12) },
+
+      titleArea: { ...baseStyles.titleArea, fontSize: fs(20) },
+      meta: { ...baseStyles.meta, fontSize: fs(13) },
+      metaLabel: { ...baseStyles.metaLabel, fontSize: fs(13) },
+      metaInput: { ...baseStyles.metaInput, fontSize: fs(14) },
+
+      smallBtn: { ...baseStyles.smallBtn, fontSize: fs(14) },
+      finishBtn: { ...baseStyles.finishBtn, fontSize: fs(14) },
+      dnfBtn: { ...baseStyles.dnfBtn, fontSize: fs(14) },
+      smallSelect: { ...baseStyles.smallSelect, fontSize: fs(14) },
+      dangerBtn: { ...baseStyles.dangerBtn, fontSize: fs(16) },
+
+      calTitle: { ...baseStyles.calTitle, fontSize: fs(22) },
+      navBtn: { ...baseStyles.navBtn, fontSize: fs(14) },
+      dow: { ...baseStyles.dow, fontSize: fs(13) },
+      dayNum: { ...baseStyles.dayNum, fontSize: fs(14) },
+      todayPill: { ...baseStyles.todayPill, fontSize: fs(11) },
+      panelTitle: { ...baseStyles.panelTitle, fontSize: fs(22) },
+      panelSubTitle: { ...baseStyles.panelSubTitle, fontSize: fs(18) },
+
+      timeInput: { ...baseStyles.timeInput, fontSize: fs(15) },
+      notesArea: { ...baseStyles.notesArea, fontSize: fs(14) },
+
+      eventTitle: { ...baseStyles.eventTitle, fontSize: fs(16) },
+      eventMeta: { ...baseStyles.eventMeta, fontSize: fs(13) },
+
+      footer: { ...baseStyles.footer, fontSize: fs(12) },
+
+      // settings extras
+      settingsGrid: {
+        display: "grid",
+        gridTemplateColumns: "minmax(420px, 1fr) minmax(420px, 1fr)",
+        gap: 14,
+        alignItems: "start",
+      },
+      settingsCard: {
+        borderRadius: 18,
+        padding: 12,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: "rgba(10,14,24,0.25)",
+      },
+      settingRow: {
+        display: "flex",
+        gap: 10,
+        alignItems: "center",
+        justifyContent: "space-between",
+        flexWrap: "wrap",
+        marginTop: 10,
+      },
+      smallText: { opacity: 0.7, fontSize: fs(12) },
+      slider: { width: 260 },
+      numberInput: {
+        width: 110,
+        padding: "10px 12px",
+        borderRadius: 14,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: "rgba(10,14,24,0.35)",
+        color: "#e8eefc",
+        fontSize: fs(14),
+      },
+    } as Record<string, any>;
+  }, [fontScale, bgImage, bgDim]);
+
+  // ---------- settings handlers ----------
+  async function pickBgFile(file: File | null) {
+    if (!file) return;
+    // ограничим размер (на всякий)
+    if (file.size > 7 * 1024 * 1024) {
+      alert("Файл слишком большой. Лучше до ~7MB 🙂");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const res = String(reader.result || "");
+      setBgImage(res);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function resetPointsRules() {
+    setPointsRules(DEFAULT_POINTS_RULES);
+  }
 
   return (
     <div style={styles.app}>
-      {/* header */}
-      <div style={styles.topBar}>
-        <div>
-          <div style={styles.h1}>F1 Personal Championship</div>
-          <div style={styles.sub}>{isTracker ? "Race Weekend — твои задачи как гоночный уик-энд" : "Личный календарь"}</div>
-        </div>
-
-        <div style={styles.tabs}>
-          <button
-            style={page === "tracker" ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-            onClick={() => setPage("tracker")}
-          >
-            🏁 Tracker
-          </button>
-          <button
-            style={page === "calendar" ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-            onClick={() => setPage("calendar")}
-          >
-            📅 Calendar
-          </button>
-        </div>
-      </div>
-
-      {/* TRACKER PAGE */}
-      {isTracker && (
-        <>
-          {/* Next GP widget (tracker) */}
-          <div style={styles.gpWrap}>
-            <div style={styles.gpCard}>
-              <div style={styles.gpTitle}>🗓️ Ближайший GP</div>
-
-              {gpError ? (
-                <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
-              ) : nextGp ? (
-                <>
-                  <div style={styles.gpName}>{nextGp.name}</div>
-                  <div style={styles.gpLoc}>{nextGp.location}</div>
-                  <div style={styles.gpCountdown}>
-                    ⏱️ {formatCountdown(nextGp.dateTimeISO)} <span style={styles.gpCountdownSmall}>({gpTick})</span>
-                  </div>
-                </>
-              ) : (
-                <div style={styles.gpErr}>Загрузка…</div>
-              )}
-
-              <button style={styles.smallGhostBtn} onClick={fetchNextGp}>
-                Обновить
-              </button>
+      {bgImage ? <div style={styles.bgOverlay} /> : null}
+      <div style={styles.content}>
+        {/* header */}
+        <div style={styles.topBar}>
+          <div>
+            <div style={styles.h1}>F1 Personal Championship</div>
+            <div style={styles.sub}>
+              {isTracker
+                ? "Race Weekend — твои задачи как гоночный уик-энд"
+                : isCalendar
+                ? "Личный календарь"
+                : "Настройки внешнего вида"}
             </div>
           </div>
 
-          {/* add task row */}
-          <div style={styles.row}>
-            <input
-              style={styles.input}
-              placeholder="Новая задача..."
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-            />
-
-            <select style={styles.select} value={session} onChange={(e) => setSession(e.target.value as SessionType)}>
-              <option value="practice">🟢 Practice</option>
-              <option value="qualifying">🟡 Qualifying</option>
-              <option value="sprint">🔴 Sprint</option>
-              <option value="race">🏁 Race Day</option>
-              <option value="pit">⬛ Pit Stop</option>
-              <option value="parc">🔧 Parc Fermé</option>
-            </select>
-
-            <input
-              style={styles.lapsInput}
-              type="number"
-              min={1}
-              max={999}
-              value={lapsTotal}
-              onChange={(e) => setLapsTotal(clampInt(e.target.value, 1, 999))}
-            />
-
-            <button style={styles.addBtn} onClick={addTask}>
-              Add
+          <div style={styles.tabs}>
+            <button
+              style={page === "tracker" ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+              onClick={() => setPage("tracker")}
+              type="button"
+            >
+              🏁 Tracker
+            </button>
+            <button
+              style={page === "calendar" ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+              onClick={() => setPage("calendar")}
+              type="button"
+            >
+              📅 Calendar
+            </button>
+            <button
+              style={page === "settings" ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+              onClick={() => setPage("settings")}
+              type="button"
+            >
+              🎛️ Settings
             </button>
           </div>
+        </div>
 
-          {/* points chips */}
-          <div style={styles.chips}>
-            <div style={styles.chip}>🏆 Total points: {points.total}</div>
-            <div style={styles.chip}>🟢 Practice: {points.bySession.practice}</div>
-            <div style={styles.chip}>🟡 Qualifying: {points.bySession.qualifying}</div>
-            <div style={styles.chip}>🔴 Sprint: {points.bySession.sprint}</div>
-            <div style={styles.chip}>🏁 Race Day: {points.bySession.race}</div>
-            <div style={styles.chip}>⬛ Pit Stop: {points.bySession.pit}</div>
-            <div style={styles.chip}>🔧 Parc Fermé: {points.bySession.parc}</div>
-            {loadingTasks && <div style={styles.chipMuted}>loading…</div>}
-          </div>
+        {/* SETTINGS PAGE */}
+        {page === "settings" && (
+          <>
+            <div style={styles.settingsGrid}>
+              {/* Appearance */}
+              <div style={styles.settingsCard}>
+                <div style={styles.panelTitle}>🎨 Внешний вид</div>
 
-          {/* hide/show Parc Fermé */}
-          <div style={{ marginBottom: 10 }}>
-            <button style={styles.smallBtn} onClick={() => setShowParc((v) => !v)} type="button">
-              {showParc ? "Скрыть Parc Fermé" : "Показать Parc Fermé"}
-            </button>
-          </div>
+                <div style={styles.panelSubTitle}>Фон</div>
 
-          {/* columns */}
-          <div style={styles.grid}>
-            <Column
-              title="Practice"
-              dot="🟢"
-              hint={sessionHint("practice")}
-              tasks={grouped.practice}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Фоновая картинка</div>
+                    <div style={styles.smallText}>Можно загрузить свою — сохранится локально на этом ноутбуке.</div>
+                  </div>
 
-            <Column
-              title="Qualifying"
-              dot="🟡"
-              hint={sessionHint("qualifying")}
-              tasks={grouped.qualifying}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => pickBgFile(e.target.files?.[0] || null)}
+                  />
 
-            <Column
-              title="Sprint"
-              dot="🔴"
-              hint={sessionHint("sprint")}
-              tasks={grouped.sprint}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+                  <button
+                    style={styles.smallBtn}
+                    onClick={() => setBgImage("")}
+                    type="button"
+                    disabled={!bgImage}
+                    title="Убрать фон"
+                  >
+                    Очистить
+                  </button>
+                </div>
 
-            <Column
-              title="Race Day"
-              dot="🏁"
-              hint={sessionHint("race")}
-              tasks={grouped.race}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Затемнение фона</div>
+                    <div style={styles.smallText}>Только фон (чтобы интерфейс читался).</div>
+                  </div>
 
-            <Column
-              title="Pit Stop"
-              dot="⬛"
-              hint={sessionHint("pit")}
-              tasks={grouped.pit}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+                  <input
+                    style={styles.slider}
+                    type="range"
+                    min={0}
+                    max={0.85}
+                    step={0.01}
+                    value={bgDim}
+                    onChange={(e) => setBgDim(clampNum(e.target.value, 0, 0.85))}
+                    disabled={!bgImage}
+                  />
+                  <div style={{ width: 60, textAlign: "right", fontWeight: 900 }}>
+                    {Math.round(bgDim * 100)}%
+                  </div>
+                </div>
 
-            {showParc && (
+                <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 12 }} />
+
+                <div style={styles.panelSubTitle}>Текст</div>
+
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Размер шрифта</div>
+                    <div style={styles.smallText}>Влияет на весь интерфейс.</div>
+                  </div>
+
+                  <input
+                    style={styles.slider}
+                    type="range"
+                    min={0.85}
+                    max={1.25}
+                    step={0.01}
+                    value={fontScale}
+                    onChange={(e) => setFontScale(clampNum(e.target.value, 0.85, 1.25))}
+                  />
+                  <div style={{ width: 60, textAlign: "right", fontWeight: 900 }}>
+                    {Math.round(fontScale * 100)}%
+                  </div>
+
+                  <button
+                    style={styles.smallBtn}
+                    onClick={() => setFontScale(1)}
+                    type="button"
+                    title="Сброс"
+                  >
+                    100%
+                  </button>
+                </div>
+
+                <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 12 }} />
+
+                <div style={styles.panelSubTitle}>Колонки</div>
+
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Parc Fermé</div>
+                    <div style={styles.smallText}>Показывать/скрывать колонку завершённых задач.</div>
+                  </div>
+
+                  <button style={styles.smallBtn} onClick={() => setShowParc((v) => !v)} type="button">
+                    {showParc ? "Скрыть Parc Fermé" : "Показать Parc Fermé"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Points rules */}
+              <div style={styles.settingsCard}>
+                <div style={styles.panelTitle}>🏁 Правила очков</div>
+
+                <div style={styles.smallText}>
+                  Эти настройки сохраняются локально. Чтобы применять их к начислению при Finish/DNF — нужно, чтобы
+                  main процесс читал эти правила (я уже вызываю <b>window.api.setPointsRules?.()</b>, если добавишь).
+                </div>
+
+                <div style={{ marginTop: 12 }} />
+
+                <div style={styles.panelSubTitle}>Базовые очки по сессиям</div>
+
+                {(
+                  [
+                    ["practice", "Practice"],
+                    ["qualifying", "Qualifying"],
+                    ["sprint", "Sprint"],
+                    ["race", "Race Day"],
+                    ["pit", "Pit Stop"],
+                    ["parc", "Parc Fermé"],
+                  ] as Array<[SessionType, string]>
+                ).map(([key, label]) => (
+                  <div key={key} style={styles.settingRow}>
+                    <div style={{ flex: 1, minWidth: 220 }}>
+                      <div style={{ fontWeight: 900 }}>
+                        {sessionDot(key)} {label}
+                      </div>
+                    </div>
+
+                    <input
+                      style={styles.numberInput}
+                      type="number"
+                      value={pointsRules.base[key]}
+                      onChange={(e) => {
+                        const n = clampInt(e.target.value, -999, 999);
+                        setPointsRules((p) => ({ ...p, base: { ...p.base, [key]: n } }));
+                      }}
+                    />
+                  </div>
+                ))}
+
+                <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 12 }} />
+
+                <div style={styles.panelSubTitle}>Штрафы</div>
+
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Просрочка: после N дней</div>
+                    <div style={styles.smallText}>Если задача завершена позже дедлайна на N+ дней.</div>
+                  </div>
+
+                  <input
+                    style={styles.numberInput}
+                    type="number"
+                    value={pointsRules.latePenaltyAfterDays}
+                    onChange={(e) => setPointsRules((p) => ({ ...p, latePenaltyAfterDays: clampInt(e.target.value, 0, 365) }))}
+                  />
+                </div>
+
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>Штраф за просрочку (Pts)</div>
+                  </div>
+
+                  <input
+                    style={styles.numberInput}
+                    type="number"
+                    value={pointsRules.latePenaltyPoints}
+                    onChange={(e) => setPointsRules((p) => ({ ...p, latePenaltyPoints: clampInt(e.target.value, -999, 999) }))}
+                  />
+                </div>
+
+                <div style={styles.settingRow}>
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontWeight: 900 }}>DNF штраф (Pts)</div>
+                  </div>
+
+                  <input
+                    style={styles.numberInput}
+                    type="number"
+                    value={pointsRules.dnfPenaltyPoints}
+                    onChange={(e) => setPointsRules((p) => ({ ...p, dnfPenaltyPoints: clampInt(e.target.value, -999, 999) }))}
+                  />
+                </div>
+
+                <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button style={styles.smallBtn} onClick={resetPointsRules} type="button">
+                    Сбросить правила
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div style={styles.footer}>
+              Подсказка: фон и шрифт — чисто UI. Очки реально применятся к новым задачам, когда main начнёт читать rules.
+            </div>
+          </>
+        )}
+
+        {/* TRACKER PAGE */}
+        {isTracker && (
+          <>
+            {/* Next GP widget (tracker) */}
+            <div style={styles.gpWrap}>
+              <div style={styles.gpCard}>
+                <div style={styles.gpTitle}>🗓️ Ближайший GP</div>
+
+                {gpError ? (
+                  <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
+                ) : nextGp ? (
+                  <>
+                    <div style={styles.gpName}>{nextGp.name}</div>
+                    <div style={styles.gpLoc}>{nextGp.location}</div>
+                    <div style={styles.gpCountdown}>
+                      ⏱️ {formatCountdown(nextGp.dateTimeISO)}{" "}
+                      <span style={styles.gpCountdownSmall}>({gpTick})</span>
+                    </div>
+                  </>
+                ) : (
+                  <div style={styles.gpErr}>Загрузка…</div>
+                )}
+
+                <button style={styles.smallGhostBtn} onClick={fetchNextGp} type="button">
+                  Обновить
+                </button>
+              </div>
+            </div>
+
+            {/* add task row */}
+            <div style={styles.row}>
+              <input
+                style={styles.input}
+                placeholder="Новая задача..."
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+              />
+
+              <select
+                style={styles.select}
+                value={session}
+                onChange={(e) => setSession(e.target.value as SessionType)}
+              >
+                <option value="practice">🟢 Practice</option>
+                <option value="qualifying">🟡 Qualifying</option>
+                <option value="sprint">🔴 Sprint</option>
+                <option value="race">🏁 Race Day</option>
+                <option value="pit">⬛ Pit Stop</option>
+                <option value="parc">🔧 Parc Fermé</option>
+              </select>
+
+              <input
+                style={styles.lapsInput}
+                type="number"
+                min={1}
+                max={999}
+                value={lapsTotal}
+                onChange={(e) => setLapsTotal(clampInt(e.target.value, 1, 999))}
+              />
+
+              <button style={styles.addBtn} onClick={addTask} type="button">
+                Add
+              </button>
+            </div>
+
+            {/* points chips */}
+            <div style={styles.chips}>
+              <div style={styles.chip}>🏆 Total points: {points.total}</div>
+              <div style={styles.chip}>🟢 Practice: {points.bySession.practice}</div>
+              <div style={styles.chip}>🟡 Qualifying: {points.bySession.qualifying}</div>
+              <div style={styles.chip}>🔴 Sprint: {points.bySession.sprint}</div>
+              <div style={styles.chip}>🏁 Race Day: {points.bySession.race}</div>
+              <div style={styles.chip}>⬛ Pit Stop: {points.bySession.pit}</div>
+              <div style={styles.chip}>🔧 Parc Fermé: {points.bySession.parc}</div>
+              {loadingTasks && <div style={styles.chipMuted}>loading…</div>}
+            </div>
+
+            {/* hide/show Parc Fermé */}
+            <div style={{ marginBottom: 10 }}>
+              <button style={styles.smallBtn} onClick={() => setShowParc((v) => !v)} type="button">
+                {showParc ? "Скрыть Parc Fermé" : "Показать Parc Fermé"}
+              </button>
+            </div>
+
+            {/* columns */}
+            <div style={styles.grid}>
               <Column
-                title="Parc Fermé"
-                dot="🔧"
-                hint={sessionHint("parc")}
-                tasks={grouped.parc}
+                title="Practice"
+                dot="🟢"
+                hint={sessionHint("practice")}
+                tasks={grouped.practice}
+                sessionKey="practice"
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                onDropTask={moveTaskToSession}
                 render={(t) => (
                   <TaskCard
                     t={t}
@@ -787,193 +1155,346 @@ export default function App() {
                   />
                 )}
               />
-            )}
-          </div>
 
-          <div style={styles.footer}>Подсказка: заголовок задачи сохраняется в SQLite при уходе с поля.</div>
-        </>
-      )}
+              <Column
+                title="Qualifying"
+                dot="🟡"
+                hint={sessionHint("qualifying")}
+                tasks={grouped.qualifying}
+                sessionKey="qualifying"
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                onDropTask={moveTaskToSession}
+                render={(t) => (
+                  <TaskCard
+                    t={t}
+                    draftTitle={draftTitle}
+                    setDraftTitle={setDraftTitle}
+                    getTitleValue={getTitleValue}
+                    saveTitleToDb={saveTitleToDb}
+                    setTasks={setTasks}
+                    incLap={incLap}
+                    finishTask={finishTask}
+                    dnfTask={dnfTask}
+                    deleteTask={deleteTask}
+                  />
+                )}
+              />
 
-      {/* CALENDAR PAGE */}
-      {!isTracker && (
-        <>
-          <div style={styles.calendarLayout}>
-            {/* left calendar */}
-            <div style={styles.calendarLeft}>
-              <div style={styles.calendarHeader}>
-                <div style={styles.calTitle}>🗓️ {monthTitle}</div>
-                <div style={styles.calNav}>
-                  <button style={styles.navBtn} onClick={goPrevMonth}>
-                    ←
-                  </button>
-                  <button style={styles.navBtn} onClick={goToday}>
-                    Сегодня
-                  </button>
-                  <button style={styles.navBtn} onClick={goNextMonth}>
-                    →
-                  </button>
-                </div>
-              </div>
+              <Column
+                title="Sprint"
+                dot="🔴"
+                hint={sessionHint("sprint")}
+                tasks={grouped.sprint}
+                sessionKey="sprint"
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                onDropTask={moveTaskToSession}
+                render={(t) => (
+                  <TaskCard
+                    t={t}
+                    draftTitle={draftTitle}
+                    setDraftTitle={setDraftTitle}
+                    getTitleValue={getTitleValue}
+                    saveTitleToDb={saveTitleToDb}
+                    setTasks={setTasks}
+                    incLap={incLap}
+                    finishTask={finishTask}
+                    dnfTask={dnfTask}
+                    deleteTask={deleteTask}
+                  />
+                )}
+              />
 
-              <div style={styles.dowRow}>
-                {["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((d) => (
-                  <div key={d} style={styles.dow}>
-                    {d}
+              <Column
+                title="Race Day"
+                dot="🏁"
+                hint={sessionHint("race")}
+                tasks={grouped.race}
+                sessionKey="race"
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                onDropTask={moveTaskToSession}
+                render={(t) => (
+                  <TaskCard
+                    t={t}
+                    draftTitle={draftTitle}
+                    setDraftTitle={setDraftTitle}
+                    getTitleValue={getTitleValue}
+                    saveTitleToDb={saveTitleToDb}
+                    setTasks={setTasks}
+                    incLap={incLap}
+                    finishTask={finishTask}
+                    dnfTask={dnfTask}
+                    deleteTask={deleteTask}
+                  />
+                )}
+              />
+
+              <Column
+                title="Pit Stop"
+                dot="⬛"
+                hint={sessionHint("pit")}
+                tasks={grouped.pit}
+                sessionKey="pit"
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                onDropTask={moveTaskToSession}
+                render={(t) => (
+                  <TaskCard
+                    t={t}
+                    draftTitle={draftTitle}
+                    setDraftTitle={setDraftTitle}
+                    getTitleValue={getTitleValue}
+                    saveTitleToDb={saveTitleToDb}
+                    setTasks={setTasks}
+                    incLap={incLap}
+                    finishTask={finishTask}
+                    dnfTask={dnfTask}
+                    deleteTask={deleteTask}
+                  />
+                )}
+              />
+
+              {showParc && (
+                <Column
+                  title="Parc Fermé"
+                  dot="🔧"
+                  hint={sessionHint("parc")}
+                  tasks={grouped.parc}
+                  sessionKey="parc"
+                  dragOver={dragOver}
+                  setDragOver={setDragOver}
+                  onDropTask={moveTaskToSession}
+                  render={(t) => (
+                    <TaskCard
+                      t={t}
+                      draftTitle={draftTitle}
+                      setDraftTitle={setDraftTitle}
+                      getTitleValue={getTitleValue}
+                      saveTitleToDb={saveTitleToDb}
+                      setTasks={setTasks}
+                      incLap={incLap}
+                      finishTask={finishTask}
+                      dnfTask={dnfTask}
+                      deleteTask={deleteTask}
+                    />
+                  )}
+                />
+              )}
+            </div>
+
+            <div style={styles.footer}>
+              Подсказка: заголовок задачи сохраняется в SQLite при уходе с поля. Перетаскивание — за ручку ⠿.
+            </div>
+          </>
+        )}
+
+        {/* CALENDAR PAGE */}
+        {isCalendar && (
+          <>
+            <div style={styles.calendarLayout}>
+              {/* left calendar */}
+              <div style={styles.calendarLeft}>
+                <div style={styles.calendarHeader}>
+                  <div style={styles.calTitle}>🗓️ {monthTitle}</div>
+                  <div style={styles.calNav}>
+                    <button style={styles.navBtn} onClick={goPrevMonth} type="button">
+                      ←
+                    </button>
+                    <button style={styles.navBtn} onClick={goToday} type="button">
+                      Сегодня
+                    </button>
+                    <button style={styles.navBtn} onClick={goNextMonth} type="button">
+                      →
+                    </button>
                   </div>
-                ))}
-              </div>
+                </div>
 
-              <div style={styles.calendarGrid}>
-                {calendarGrid.map((cell) => (
-                  <button
-                    key={cell.date}
-                    style={{
-                      ...styles.dayCell,
-                      ...(cell.inMonth ? {} : styles.dayCellOut),
-                      ...(cell.date === selectedDay ? styles.dayCellSelected : {}),
-                    }}
-                    onClick={() => setSelectedDay(cell.date)}
-                    title={fmtRuDate(cell.date)}
-                  >
-                    <div style={styles.dayNumRow}>
-                      <div style={styles.dayNum}>{Number(cell.date.split("-")[2])}</div>
-                      {cell.isToday && <div style={styles.todayPill}>today</div>}
+                <div style={styles.dowRow}>
+                  {["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((d) => (
+                    <div key={d} style={styles.dow}>
+                      {d}
                     </div>
+                  ))}
+                </div>
 
-                    {cell.hasEvents && <div style={styles.eventDot} title="Личные события" />}
-                    {cell.hasF1 && <div style={styles.f1Dot} title="F1 GP" />}
-                  </button>
-                ))}
+                <div style={styles.calendarGrid}>
+                  {calendarGrid.map((cell) => (
+                    <button
+                      key={cell.date}
+                      style={{
+                        ...styles.dayCell,
+                        ...(cell.inMonth ? {} : styles.dayCellOut),
+                        ...(cell.date === selectedDay ? styles.dayCellSelected : {}),
+                      }}
+                      onClick={() => setSelectedDay(cell.date)}
+                      title={fmtRuDate(cell.date)}
+                      type="button"
+                    >
+                      <div style={styles.dayNumRow}>
+                        <div style={styles.dayNum}>{Number(cell.date.split("-")[2])}</div>
+                        {cell.isToday && <div style={styles.todayPill}>today</div>}
+                      </div>
+
+                      {cell.hasEvents && <div style={styles.eventDot} title="Личные события" />}
+                      {cell.hasF1 && <div style={styles.f1Dot} title="F1 GP" />}
+                    </button>
+                  ))}
+                </div>
+
+                <div style={styles.noteSmall}>● жёлтая точка = твои события, ● красная точка = F1 GP</div>
               </div>
 
-              <div style={styles.noteSmall}>
-                ● жёлтая точка = твои события, ● красная точка = F1 GP
+              {/* right panel */}
+              <div style={styles.calendarRight}>
+                <div style={styles.panelCard}>
+                  <div style={styles.panelTitle}>📌 Событие на {selectedDay}</div>
+
+                  {calErr ? <div style={styles.gpErr}>Calendar: {calErr}</div> : null}
+
+                  <input
+                    style={styles.input}
+                    placeholder="Название события..."
+                    value={evTitle}
+                    onChange={(e) => setEvTitle(e.target.value)}
+                  />
+
+                  <div style={styles.row2}>
+                    <input
+                      style={styles.timeInput}
+                      type="time"
+                      value={evStart}
+                      onChange={(e) => setEvStart(e.target.value)}
+                    />
+                    <input
+                      style={styles.timeInput}
+                      type="time"
+                      value={evEnd}
+                      onChange={(e) => setEvEnd(e.target.value)}
+                    />
+                    <button style={styles.addBtn} onClick={addEvent} type="button">
+                      Добавить
+                    </button>
+                  </div>
+
+                  <input
+                    style={styles.input}
+                    placeholder="Локация (опционально)..."
+                    value={evLoc}
+                    onChange={(e) => setEvLoc(e.target.value)}
+                  />
+
+                  <textarea
+                    style={styles.notesArea}
+                    placeholder="Заметки (опционально)…"
+                    value={evNotes}
+                    onChange={(e) => setEvNotes(e.target.value)}
+                    rows={4}
+                  />
+
+                  {/* F1 today */}
+                  <div style={styles.panelSubTitleRow}>
+                    <div style={styles.panelSubTitle}>🏎️ F1 в этот день</div>
+                    <button style={styles.smallGhostBtn} onClick={loadF1Schedule} type="button">
+                      Обновить F1
+                    </button>
+                  </div>
+
+                  {f1Err ? (
+                    <div style={styles.gpErr}>F1: {f1Err}</div>
+                  ) : dayF1.length === 0 ? (
+                    <div style={styles.empty}>Нет гонки</div>
+                  ) : (
+                    <div style={styles.eventList}>
+                      {dayF1.map((r) => (
+                        <div key={`${r.round}_${r.date}`} style={styles.eventItem}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={styles.eventTitle}>
+                              🏁 #{r.round} {r.raceName}
+                            </div>
+                            <div style={styles.eventMeta}>
+                              {r.locality}
+                              {r.country ? `, ${r.country}` : ""} · {r.circuitName}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* personal events */}
+                  <div style={styles.panelSubTitle}>События дня</div>
+
+                  {loadingEvents ? (
+                    <div style={styles.empty}>Загрузка…</div>
+                  ) : dayEvents.length === 0 ? (
+                    <div style={styles.empty}>Нет событий</div>
+                  ) : (
+                    <div style={styles.eventList}>
+                      {dayEvents.map((ev) => (
+                        <div key={ev.id} style={styles.eventItem}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={styles.eventTitle}>{ev.title}</div>
+                            <div style={styles.eventMeta}>
+                              {ev.startTime || ev.endTime ? (
+                                <span>
+                                  {ev.startTime || "--:--"}–{ev.endTime || "--:--"}
+                                </span>
+                              ) : (
+                                <span>--:--</span>
+                              )}
+                              {ev.location ? <span> · {ev.location}</span> : null}
+                            </div>
+                          </div>
+                          <button
+                            style={styles.eventDelBtn}
+                            onClick={() => deleteEvent(ev.id)}
+                            type="button"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={styles.noteSmall}>
+                    События сохраняются в SQLite (calendar_events).
+                  </div>
+                </div>
+
+                {/* Next GP widget (calendar) */}
+                <div style={styles.gpCardSmall}>
+                  <div style={styles.gpTitleSmall}>🗓️ Ближайший GP</div>
+
+                  {gpError ? (
+                    <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
+                  ) : nextGp ? (
+                    <>
+                      <div style={styles.gpNameSmall}>{nextGp.name}</div>
+                      <div style={styles.gpLocSmall}>{nextGp.location}</div>
+                      <div style={styles.gpCountdownSmallRow}>
+                        ⏱️ {formatCountdown(nextGp.dateTimeISO)}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={styles.gpErr}>Загрузка…</div>
+                  )}
+
+                  <button style={styles.smallGhostBtn} onClick={fetchNextGp} type="button">
+                    Обновить
+                  </button>
+                </div>
               </div>
             </div>
 
-            {/* right panel */}
-            <div style={styles.calendarRight}>
-              <div style={styles.panelCard}>
-                <div style={styles.panelTitle}>📌 Событие на {selectedDay}</div>
-
-                <input
-                  style={styles.input}
-                  placeholder="Название события..."
-                  value={evTitle}
-                  onChange={(e) => setEvTitle(e.target.value)}
-                />
-
-                <div style={styles.row2}>
-                  <input style={styles.timeInput} type="time" value={evStart} onChange={(e) => setEvStart(e.target.value)} />
-                  <input style={styles.timeInput} type="time" value={evEnd} onChange={(e) => setEvEnd(e.target.value)} />
-                  <button style={styles.addBtn} onClick={addEvent}>
-                    Добавить
-                  </button>
-                </div>
-
-                <input
-                  style={styles.input}
-                  placeholder="Локация (опционально)..."
-                  value={evLoc}
-                  onChange={(e) => setEvLoc(e.target.value)}
-                />
-
-                <textarea
-                  style={styles.notesArea}
-                  placeholder="Заметки (опционально)…"
-                  value={evNotes}
-                  onChange={(e) => setEvNotes(e.target.value)}
-                  rows={4}
-                />
-
-                {/* F1 today */}
-                <div style={styles.panelSubTitleRow}>
-                  <div style={styles.panelSubTitle}>🏎️ F1 в этот день</div>
-                  <button style={styles.smallGhostBtn} onClick={loadF1Schedule} type="button">
-                    Обновить F1
-                  </button>
-                </div>
-
-                {f1Err ? (
-                  <div style={styles.gpErr}>F1: {f1Err}</div>
-                ) : dayF1.length === 0 ? (
-                  <div style={styles.empty}>Нет гонки</div>
-                ) : (
-                  <div style={styles.eventList}>
-                    {dayF1.map((r) => (
-                      <div key={`${r.round}_${r.date}`} style={styles.eventItem}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={styles.eventTitle}>🏁 #{r.round} {r.raceName}</div>
-                          <div style={styles.eventMeta}>
-                            {r.locality}{r.country ? `, ${r.country}` : ""} · {r.circuitName}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* personal events */}
-                <div style={styles.panelSubTitle}>События дня</div>
-
-                {dayEvents.length === 0 ? (
-                  <div style={styles.empty}>Нет событий</div>
-                ) : (
-                  <div style={styles.eventList}>
-                    {dayEvents.map((ev) => (
-                      <div key={ev.id} style={styles.eventItem}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={styles.eventTitle}>{ev.title}</div>
-                          <div style={styles.eventMeta}>
-                            {ev.startTime || ev.endTime ? (
-                              <span>
-                                {ev.startTime || "--:--"}–{ev.endTime || "--:--"}
-                              </span>
-                            ) : (
-                              <span>--:--</span>
-                            )}
-                            {ev.location ? <span> · {ev.location}</span> : null}
-                          </div>
-                        </div>
-                        <button style={styles.eventDelBtn} onClick={() => deleteEvent(ev.id)}>
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div style={styles.noteSmall}>Личные события сохраняются локально (localStorage).</div>
-              </div>
-
-              {/* Next GP widget (calendar) */}
-              <div style={styles.gpCardSmall}>
-                <div style={styles.gpTitleSmall}>🗓️ Ближайший GP</div>
-
-                {gpError ? (
-                  <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
-                ) : nextGp ? (
-                  <>
-                    <div style={styles.gpNameSmall}>{nextGp.name}</div>
-                    <div style={styles.gpLocSmall}>{nextGp.location}</div>
-                    <div style={styles.gpCountdownSmallRow}>⏱️ {formatCountdown(nextGp.dateTimeISO)}</div>
-                  </>
-                ) : (
-                  <div style={styles.gpErr}>Загрузка…</div>
-                )}
-
-                <button style={styles.smallGhostBtn} onClick={fetchNextGp}>
-                  Обновить
-                </button>
-              </div>
+            <div style={styles.footer}>
+              Примечание: F1 расписание грузится только на вкладке Calendar (через IPC), точки отмечают дни GP.
             </div>
-          </div>
-
-          <div style={styles.footer}>
-            Примечание: F1 расписание грузится только на вкладке Calendar (через IPC), точки отмечают дни GP.
-          </div>
-        </>
-      )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -985,19 +1506,51 @@ function Column(props: {
   hint: string;
   tasks: Task[];
   render: (t: Task) => React.ReactNode;
+
+  sessionKey: SessionType;
+  dragOver: SessionType | null;
+  setDragOver: (v: SessionType | null) => void;
+  onDropTask: (id: number, to: SessionType) => void;
 }) {
+  const isOver = props.dragOver === props.sessionKey;
+
   return (
-    <div style={styles.column}>
-      <div style={styles.columnHeader}>
-        <div style={styles.columnTitle}>
+    <div
+      style={{
+        ...baseStyles.column,
+        ...(isOver ? baseStyles.columnDragOver : {}),
+      }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        props.setDragOver(props.sessionKey);
+      }}
+      onDragLeave={() => {
+        props.setDragOver((prev) => (prev === props.sessionKey ? null : prev));
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        props.setDragOver(null);
+        const raw = e.dataTransfer.getData(DND_TASK);
+        if (!raw) return;
+        const id = Number(raw);
+        if (!Number.isFinite(id)) return;
+        props.onDropTask(id, props.sessionKey);
+      }}
+    >
+      <div style={baseStyles.columnHeader}>
+        <div style={baseStyles.columnTitle}>
           <span style={{ opacity: 0.95 }}>{props.dot}</span>
           <span>{props.title}</span>
         </div>
-        <div style={styles.columnHint}>{props.hint}</div>
+        <div style={baseStyles.columnHint}>{props.hint}</div>
       </div>
 
-      <div style={styles.cards}>
-        {props.tasks.length === 0 ? <div style={styles.empty}>Пусто</div> : props.tasks.map((t) => props.render(t))}
+      <div style={baseStyles.cards}>
+        {props.tasks.length === 0 ? (
+          <div style={baseStyles.empty}>Пусто</div>
+        ) : (
+          props.tasks.map((t) => props.render(t))
+        )}
       </div>
     </div>
   );
@@ -1026,12 +1579,29 @@ function TaskCard(props: {
     el.style.height = `${el.scrollHeight}px`;
   }, [val]);
 
+  const done = t.status === "finish" || t.status === "dnf";
+
   return (
-    <div style={styles.card}>
-      <div style={styles.cardTop}>
+    <div style={baseStyles.card}>
+      <div style={baseStyles.cardTop}>
+        <div
+          style={{
+            ...baseStyles.dragHandle,
+            ...(done ? baseStyles.dragHandleDisabled : {}),
+          }}
+          title={done ? "Завершённые задачи не перетаскиваются" : "Перетащить"}
+          draggable={!done}
+          onDragStart={(e) => {
+            e.dataTransfer.setData(DND_TASK, String(t.id));
+            e.dataTransfer.effectAllowed = "move";
+          }}
+        >
+          ⠿
+        </div>
+
         <textarea
           ref={areaRef}
-          style={styles.titleArea}
+          style={baseStyles.titleArea}
           value={val}
           rows={1}
           onChange={(e) => {
@@ -1041,18 +1611,20 @@ function TaskCard(props: {
           onBlur={() => props.saveTitleToDb(t.id)}
         />
 
-        <div style={styles.badge(t.status)}>
+        <div style={baseStyles.badge(t.status)}>
           {statusText(t.status)} · Pts: {Number(t.points_total ?? 0)}
         </div>
       </div>
 
-      <div style={styles.meta}>Laps {t.laps_done}/{t.laps_total}</div>
+      <div style={baseStyles.meta}>
+        Laps {t.laps_done}/{t.laps_total}
+      </div>
 
-      <div style={styles.metaRow}>
-        <div style={styles.metaLabel}>
+      <div style={baseStyles.metaRow}>
+        <div style={baseStyles.metaLabel}>
           Deadline:
           <input
-            style={styles.metaInput}
+            style={baseStyles.metaInput}
             type="date"
             value={t.deadline ? String(t.deadline) : ""}
             onChange={async (e) => {
@@ -1064,58 +1636,78 @@ function TaskCard(props: {
         </div>
       </div>
 
-      <div style={styles.actions}>
-        <button onClick={() => props.incLap(t)} style={styles.smallBtn}>
+      <div style={baseStyles.actions}>
+        <button onClick={() => props.incLap(t)} style={baseStyles.smallBtn} type="button">
           + Lap
         </button>
 
         <button
           onClick={() => props.finishTask(t.id)}
-          style={styles.finishBtn}
-          disabled={t.status === "finish" || t.status === "dnf"}
+          style={baseStyles.finishBtn}
+          disabled={done}
           title="Финишировать и начислить очки"
+          type="button"
         >
           Finish
         </button>
 
         <button
           onClick={() => props.dnfTask(t.id)}
-          style={styles.dnfBtn}
-          disabled={t.status === "finish" || t.status === "dnf"}
+          style={baseStyles.dnfBtn}
+          disabled={done}
           title="DNF"
+          type="button"
         >
           DNF
         </button>
 
-        <button onClick={() => props.deleteTask(t.id)} style={styles.dangerBtn} title="Удалить задачу">
+        <button
+          onClick={() => props.deleteTask(t.id)}
+          style={baseStyles.dangerBtn}
+          title="Удалить задачу"
+          type="button"
+        >
           ×
         </button>
       </div>
 
-      <div style={styles.actions}>
+      <div style={baseStyles.actions}>
         <select
-          style={styles.smallSelect}
+          style={baseStyles.smallSelect}
           value={t.session_type}
           onChange={async (e) => {
             const v = e.target.value as SessionType;
             props.setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, session_type: v } : x)));
             await window.api.updateTask({ id: t.id, session_type: v });
           }}
+          disabled={done}
         >
-          <option value="practice">{sessionDot("practice")} {sessionLabel("practice")}</option>
-          <option value="qualifying">{sessionDot("qualifying")} {sessionLabel("qualifying")}</option>
-          <option value="sprint">{sessionDot("sprint")} {sessionLabel("sprint")}</option>
-          <option value="race">{sessionDot("race")} {sessionLabel("race")}</option>
-          <option value="pit">{sessionDot("pit")} {sessionLabel("pit")}</option>
-          <option value="parc">{sessionDot("parc")} {sessionLabel("parc")}</option>
+          <option value="practice">
+            {sessionDot("practice")} {sessionLabel("practice")}
+          </option>
+          <option value="qualifying">
+            {sessionDot("qualifying")} {sessionLabel("qualifying")}
+          </option>
+          <option value="sprint">
+            {sessionDot("sprint")} {sessionLabel("sprint")}
+          </option>
+          <option value="race">
+            {sessionDot("race")} {sessionLabel("race")}
+          </option>
+          <option value="pit">
+            {sessionDot("pit")} {sessionLabel("pit")}
+          </option>
+          <option value="parc">
+            {sessionDot("parc")} {sessionLabel("parc")}
+          </option>
         </select>
       </div>
     </div>
   );
 }
 
-// ---------- styles ----------
-const styles: Record<string, any> = {
+// ---------- styles (base) ----------
+const baseStyles: Record<string, any> = {
   app: {
     height: "100vh",
     overflowY: "auto",
@@ -1255,6 +1847,12 @@ const styles: Record<string, any> = {
     background: "rgba(14,20,34,0.72)",
     minHeight: 220,
   },
+
+  columnDragOver: {
+    outline: "2px solid rgba(247,201,72,0.9)",
+    boxShadow: "0 0 0 4px rgba(247,201,72,0.12)",
+  },
+
   columnHeader: { marginBottom: 10 },
   columnTitle: { display: "flex", gap: 10, fontWeight: 900, fontSize: 22, alignItems: "center" },
   columnHint: { marginTop: 6, opacity: 0.75, fontSize: 12 },
@@ -1269,6 +1867,26 @@ const styles: Record<string, any> = {
     padding: 12,
   },
   cardTop: { display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" },
+
+  dragHandle: {
+    width: 26,
+    height: 26,
+    borderRadius: 10,
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "rgba(10,14,24,0.35)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "grab",
+    userSelect: "none",
+    flexShrink: 0,
+    marginRight: 8,
+    fontWeight: 900,
+  },
+  dragHandleDisabled: {
+    opacity: 0.35,
+    cursor: "not-allowed",
+  },
 
   titleArea: {
     flex: 1,
@@ -1483,7 +2101,13 @@ const styles: Record<string, any> = {
     background: "rgba(10,14,24,0.25)",
   },
   panelTitle: { fontSize: 22, fontWeight: 900, marginBottom: 10 },
-  panelSubTitleRow: { display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginTop: 10 },
+  panelSubTitleRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 10,
+    alignItems: "center",
+    marginTop: 10,
+  },
   panelSubTitle: { fontSize: 18, fontWeight: 900, opacity: 0.95 },
 
   timeInput: {
@@ -1536,7 +2160,6 @@ const styles: Record<string, any> = {
 
   noteSmall: { marginTop: 10, opacity: 0.65, fontSize: 12 },
 
-  // small GP card on calendar page
   gpCardSmall: {
     borderRadius: 18,
     padding: 12,

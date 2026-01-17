@@ -1,18 +1,16 @@
-name: Build (macOS + Windows)
+name: Build and Release
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -27,22 +25,7 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Build (vite/electron)
-        run: npm run build
-      
-      - name: Rebuild native modules (better-sqlite3)
-        run: npx electron-builder install-app-deps
-
-      # Сборка установщиков. Должен быть electron-builder в devDependencies и скрипт dist.
-      - name: Dist
-        run: npm run dist
+      - name: Build & publish (Windows)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ matrix.os }}
-          path: |
-            dist/**
-            !dist/**/*.blockmap
+        run: npm run release
