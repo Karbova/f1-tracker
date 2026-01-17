@@ -20,6 +20,16 @@ type NextGp = {
   dateTimeISO: string;
 };
 
+type F1Race = {
+  round: number;
+  raceName: string;
+  circuitName: string;
+  locality: string;
+  country: string;
+  date: string; // YYYY-MM-DD
+  dateTimeISO: string; // YYYY-MM-DDTHH:MM:SSZ
+};
+
 type CalendarEvent = {
   id: string;
   title: string;
@@ -42,6 +52,7 @@ declare global {
       finishTask: (id: number) => Promise<any>;
       dnfTask: (id: number) => Promise<any>;
       getNextGp: () => Promise<NextGp>;
+      getF1Schedule: (season?: string | number) => Promise<F1Race[]>;
     };
   }
 }
@@ -60,7 +71,6 @@ function toYMD(d: Date) {
 }
 
 function fmtRuDate(ymd: string) {
-  // YYYY-MM-DD -> DD.MM.YYYY
   const [y, m, d] = ymd.split("-");
   return `${d}.${m}.${y}`;
 }
@@ -109,7 +119,7 @@ function sessionHint(s: SessionType) {
     case "pit":
       return "Мелкие быстрые дела";
     case "parc":
-      return "Обзор/ретро, обслуживание системы";
+      return "Завершённое / ретро / обслуживание";
   }
 }
 
@@ -141,6 +151,8 @@ function statusText(st: Status) {
 const LS_PAGE = "f1_page";
 const LS_EVENTS = "f1_calendar_events";
 const LS_GP_CACHE = "f1_next_gp_cache_v2";
+const LS_SHOW_PARC = "f1_show_parc";
+const LS_F1_SCHEDULE_CACHE = "f1_schedule_cache_v1";
 
 type Page = "tracker" | "calendar";
 
@@ -157,6 +169,15 @@ export default function App() {
   // -------- tasks (SQLite) --------
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loadingTasks, setLoadingTasks] = useState(false);
+
+  const [showParc, setShowParc] = useState<boolean>(() => {
+    const raw = localStorage.getItem(LS_SHOW_PARC);
+    if (raw === "0") return false;
+    return true;
+  });
+  useEffect(() => {
+    localStorage.setItem(LS_SHOW_PARC, showParc ? "1" : "0");
+  }, [showParc]);
 
   async function reloadTasks() {
     setLoadingTasks(true);
@@ -183,7 +204,6 @@ export default function App() {
       if (!raw) return null;
       const obj = JSON.parse(raw);
       if (!obj?.data) return null;
-      // cache valid 24h
       const age = Date.now() - Number(obj.ts || 0);
       if (age > 24 * 3600 * 1000) return null;
       return obj.data as NextGp;
@@ -268,7 +288,7 @@ export default function App() {
 
   async function incLap(task: Task) {
     const nextDone = clampInt(task.laps_done + 1, 0, task.laps_total);
-    const nextStatus: Status = nextDone >= task.laps_total ? "progress" : "progress";
+    const nextStatus: Status = "progress";
 
     // локально (быстро)
     setTasks((prev) =>
@@ -284,8 +304,6 @@ export default function App() {
   }
 
   // -------- title editing (fix 1-char bug) --------
-  // Важно: НЕ пишем в sqlite на каждый символ.
-  // Пишем только onBlur.
   const [draftTitle, setDraftTitle] = useState<Record<number, string>>({});
 
   function getTitleValue(t: Task) {
@@ -295,7 +313,6 @@ export default function App() {
   async function saveTitleToDb(id: number) {
     const v = (draftTitle[id] ?? "").trim();
     if (!v) {
-      // не даём пустое — откатываем
       setDraftTitle((p) => {
         const copy = { ...p };
         delete copy[id];
@@ -304,12 +321,9 @@ export default function App() {
       return;
     }
 
-    // локально обновим tasks
     setTasks((prev) => prev.map((x) => (x.id === id ? { ...x, title: v } : x)));
-    // сохраним в БД
     await window.api.updateTask({ id, title: v });
 
-    // очистим draft (чтобы дальше брались данные из tasks)
     setDraftTitle((p) => {
       const copy = { ...p };
       delete copy[id];
@@ -347,7 +361,16 @@ export default function App() {
       pit: [],
       parc: [],
     };
-    for (const t of tasks) (map[t.session_type] ??= []).push(t);
+
+    for (const t of tasks) {
+      const done = t.status === "finish" || t.status === "dnf";
+      if (done) {
+        map.parc.push(t);
+        continue;
+      }
+      (map[t.session_type] ?? map.practice).push(t);
+    }
+
     return map;
   }, [tasks]);
 
@@ -372,6 +395,52 @@ export default function App() {
     }
   }, [events]);
 
+  // -------- F1 schedule (Calendar only) --------
+  const [f1Races, setF1Races] = useState<F1Race[]>(() => {
+    try {
+      const raw = localStorage.getItem(LS_F1_SCHEDULE_CACHE);
+      if (!raw) return [];
+      const obj = JSON.parse(raw);
+      const age = Date.now() - Number(obj.ts || 0);
+      if (age > 24 * 3600 * 1000) return [];
+      return (obj.data || []) as F1Race[];
+    } catch {
+      return [];
+    }
+  });
+  const [f1Err, setF1Err] = useState<string | null>(null);
+
+  async function loadF1Schedule() {
+    try {
+      setF1Err(null);
+      const races = await window.api.getF1Schedule("current");
+      setF1Races(races || []);
+      try {
+        localStorage.setItem(LS_F1_SCHEDULE_CACHE, JSON.stringify({ ts: Date.now(), data: races || [] }));
+      } catch {}
+    } catch (e: any) {
+      setF1Err(e?.message ? String(e.message) : "Failed to load F1 schedule");
+    }
+  }
+
+  useEffect(() => {
+    if (page === "calendar" && f1Races.length === 0) {
+      loadF1Schedule();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
+
+  const f1ByDate = useMemo(() => {
+    const m = new Map<string, F1Race[]>();
+    for (const r of f1Races) {
+      const arr = m.get(r.date) ?? [];
+      arr.push(r);
+      m.set(r.date, arr);
+    }
+    return m;
+  }, [f1Races]);
+
+  // -------- calendar month & selection --------
   const [calMonth, setCalMonth] = useState<Date>(() => {
     const d = new Date();
     return new Date(d.getFullYear(), d.getMonth(), 1);
@@ -404,26 +473,38 @@ export default function App() {
     const start = new Date(first);
     start.setDate(first.getDate() - startDow);
 
-    const days: { date: string; inMonth: boolean; isToday: boolean; hasEvents: boolean }[] = [];
+    const days: {
+      date: string;
+      inMonth: boolean;
+      isToday: boolean;
+      hasEvents: boolean;
+      hasF1: boolean;
+    }[] = [];
+
     const today = toYMD(new Date());
 
     for (let i = 0; i < 42; i++) {
       const d = new Date(start);
       d.setDate(start.getDate() + i);
       const ymd = toYMD(d);
+
       const inMonth = d.getMonth() === calMonth.getMonth();
       const isToday = ymd === today;
       const hasEvents = events.some((ev) => ev.date === ymd);
-      days.push({ date: ymd, inMonth, isToday, hasEvents });
+      const hasF1 = (f1ByDate.get(ymd)?.length ?? 0) > 0;
+
+      days.push({ date: ymd, inMonth, isToday, hasEvents, hasF1 });
     }
     return days;
-  }, [calMonth, events]);
+  }, [calMonth, events, f1ByDate]);
 
   const dayEvents = useMemo(() => {
     return events
       .filter((e) => e.date === selectedDay)
       .sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
   }, [events, selectedDay]);
+
+  const dayF1 = useMemo(() => f1ByDate.get(selectedDay) ?? [], [f1ByDate, selectedDay]);
 
   // calendar form
   const [evTitle, setEvTitle] = useState("");
@@ -480,9 +561,7 @@ export default function App() {
       <div style={styles.topBar}>
         <div>
           <div style={styles.h1}>F1 Personal Championship</div>
-          <div style={styles.sub}>
-            {isTracker ? "Race Weekend — твои задачи как гоночный уик-энд" : "Личный календарь"}
-          </div>
+          <div style={styles.sub}>{isTracker ? "Race Weekend — твои задачи как гоночный уик-энд" : "Личный календарь"}</div>
         </div>
 
         <div style={styles.tabs}>
@@ -516,8 +595,7 @@ export default function App() {
                   <div style={styles.gpName}>{nextGp.name}</div>
                   <div style={styles.gpLoc}>{nextGp.location}</div>
                   <div style={styles.gpCountdown}>
-                    ⏱️ {formatCountdown(nextGp.dateTimeISO)}{" "}
-                    <span style={styles.gpCountdownSmall}>({gpTick})</span>
+                    ⏱️ {formatCountdown(nextGp.dateTimeISO)} <span style={styles.gpCountdownSmall}>({gpTick})</span>
                   </div>
                 </>
               ) : (
@@ -539,11 +617,7 @@ export default function App() {
               onChange={(e) => setTitle(e.target.value)}
             />
 
-            <select
-              style={styles.select}
-              value={session}
-              onChange={(e) => setSession(e.target.value as SessionType)}
-            >
+            <select style={styles.select} value={session} onChange={(e) => setSession(e.target.value as SessionType)}>
               <option value="practice">🟢 Practice</option>
               <option value="qualifying">🟡 Qualifying</option>
               <option value="sprint">🔴 Sprint</option>
@@ -569,25 +643,20 @@ export default function App() {
           {/* points chips */}
           <div style={styles.chips}>
             <div style={styles.chip}>🏆 Total points: {points.total}</div>
-            <div style={styles.chip}>
-              🟢 Practice: {points.bySession.practice}
-            </div>
-            <div style={styles.chip}>
-              🟡 Qualifying: {points.bySession.qualifying}
-            </div>
-            <div style={styles.chip}>
-              🔴 Sprint: {points.bySession.sprint}
-            </div>
-            <div style={styles.chip}>
-              🏁 Race Day: {points.bySession.race}
-            </div>
-            <div style={styles.chip}>
-              ⬛ Pit Stop: {points.bySession.pit}
-            </div>
-            <div style={styles.chip}>
-              🔧 Parc Fermé: {points.bySession.parc}
-            </div>
+            <div style={styles.chip}>🟢 Practice: {points.bySession.practice}</div>
+            <div style={styles.chip}>🟡 Qualifying: {points.bySession.qualifying}</div>
+            <div style={styles.chip}>🔴 Sprint: {points.bySession.sprint}</div>
+            <div style={styles.chip}>🏁 Race Day: {points.bySession.race}</div>
+            <div style={styles.chip}>⬛ Pit Stop: {points.bySession.pit}</div>
+            <div style={styles.chip}>🔧 Parc Fermé: {points.bySession.parc}</div>
             {loadingTasks && <div style={styles.chipMuted}>loading…</div>}
+          </div>
+
+          {/* hide/show Parc Fermé */}
+          <div style={{ marginBottom: 10 }}>
+            <button style={styles.smallBtn} onClick={() => setShowParc((v) => !v)} type="button">
+              {showParc ? "Скрыть Parc Fermé" : "Показать Parc Fermé"}
+            </button>
           </div>
 
           {/* columns */}
@@ -612,6 +681,7 @@ export default function App() {
                 />
               )}
             />
+
             <Column
               title="Qualifying"
               dot="🟡"
@@ -632,6 +702,7 @@ export default function App() {
                 />
               )}
             />
+
             <Column
               title="Sprint"
               dot="🔴"
@@ -673,6 +744,7 @@ export default function App() {
                 />
               )}
             />
+
             <Column
               title="Pit Stop"
               dot="⬛"
@@ -693,31 +765,32 @@ export default function App() {
                 />
               )}
             />
-            <Column
-              title="Parc Fermé"
-              dot="🔧"
-              hint={sessionHint("parc")}
-              tasks={grouped.parc}
-              render={(t) => (
-                <TaskCard
-                  t={t}
-                  draftTitle={draftTitle}
-                  setDraftTitle={setDraftTitle}
-                  getTitleValue={getTitleValue}
-                  saveTitleToDb={saveTitleToDb}
-                  setTasks={setTasks}
-                  incLap={incLap}
-                  finishTask={finishTask}
-                  dnfTask={dnfTask}
-                  deleteTask={deleteTask}
-                />
-              )}
-            />
+
+            {showParc && (
+              <Column
+                title="Parc Fermé"
+                dot="🔧"
+                hint={sessionHint("parc")}
+                tasks={grouped.parc}
+                render={(t) => (
+                  <TaskCard
+                    t={t}
+                    draftTitle={draftTitle}
+                    setDraftTitle={setDraftTitle}
+                    getTitleValue={getTitleValue}
+                    saveTitleToDb={saveTitleToDb}
+                    setTasks={setTasks}
+                    incLap={incLap}
+                    finishTask={finishTask}
+                    dnfTask={dnfTask}
+                    deleteTask={deleteTask}
+                  />
+                )}
+              />
+            )}
           </div>
 
-          <div style={styles.footer}>
-            Подсказка: заголовок задачи редактируется локально, а в SQLite сохраняется при уходе с поля.
-          </div>
+          <div style={styles.footer}>Подсказка: заголовок задачи сохраняется в SQLite при уходе с поля.</div>
         </>
       )}
 
@@ -763,14 +836,18 @@ export default function App() {
                     title={fmtRuDate(cell.date)}
                   >
                     <div style={styles.dayNumRow}>
-                      <div style={styles.dayNum}>
-                        {Number(cell.date.split("-")[2])}
-                      </div>
+                      <div style={styles.dayNum}>{Number(cell.date.split("-")[2])}</div>
                       {cell.isToday && <div style={styles.todayPill}>today</div>}
                     </div>
-                    {cell.hasEvents && <div style={styles.eventDot} />}
+
+                    {cell.hasEvents && <div style={styles.eventDot} title="Личные события" />}
+                    {cell.hasF1 && <div style={styles.f1Dot} title="F1 GP" />}
                   </button>
                 ))}
+              </div>
+
+              <div style={styles.noteSmall}>
+                ● жёлтая точка = твои события, ● красная точка = F1 GP
               </div>
             </div>
 
@@ -787,18 +864,8 @@ export default function App() {
                 />
 
                 <div style={styles.row2}>
-                  <input
-                    style={styles.timeInput}
-                    type="time"
-                    value={evStart}
-                    onChange={(e) => setEvStart(e.target.value)}
-                  />
-                  <input
-                    style={styles.timeInput}
-                    type="time"
-                    value={evEnd}
-                    onChange={(e) => setEvEnd(e.target.value)}
-                  />
+                  <input style={styles.timeInput} type="time" value={evStart} onChange={(e) => setEvStart(e.target.value)} />
+                  <input style={styles.timeInput} type="time" value={evEnd} onChange={(e) => setEvEnd(e.target.value)} />
                   <button style={styles.addBtn} onClick={addEvent}>
                     Добавить
                   </button>
@@ -819,6 +886,34 @@ export default function App() {
                   rows={4}
                 />
 
+                {/* F1 today */}
+                <div style={styles.panelSubTitleRow}>
+                  <div style={styles.panelSubTitle}>🏎️ F1 в этот день</div>
+                  <button style={styles.smallGhostBtn} onClick={loadF1Schedule} type="button">
+                    Обновить F1
+                  </button>
+                </div>
+
+                {f1Err ? (
+                  <div style={styles.gpErr}>F1: {f1Err}</div>
+                ) : dayF1.length === 0 ? (
+                  <div style={styles.empty}>Нет гонки</div>
+                ) : (
+                  <div style={styles.eventList}>
+                    {dayF1.map((r) => (
+                      <div key={`${r.round}_${r.date}`} style={styles.eventItem}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={styles.eventTitle}>🏁 #{r.round} {r.raceName}</div>
+                          <div style={styles.eventMeta}>
+                            {r.locality}{r.country ? `, ${r.country}` : ""} · {r.circuitName}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* personal events */}
                 <div style={styles.panelSubTitle}>События дня</div>
 
                 {dayEvents.length === 0 ? (
@@ -830,9 +925,9 @@ export default function App() {
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={styles.eventTitle}>{ev.title}</div>
                           <div style={styles.eventMeta}>
-                            {(ev.startTime || ev.endTime) ? (
+                            {ev.startTime || ev.endTime ? (
                               <span>
-                                {(ev.startTime || "--:--")}–{(ev.endTime || "--:--")}
+                                {ev.startTime || "--:--"}–{ev.endTime || "--:--"}
                               </span>
                             ) : (
                               <span>--:--</span>
@@ -875,7 +970,7 @@ export default function App() {
           </div>
 
           <div style={styles.footer}>
-            Примечание: виджет “Ближайший GP” грузится через IPC (main → renderer), поэтому CSP больше не мешает.
+            Примечание: F1 расписание грузится только на вкладке Calendar (через IPC), точки отмечают дни GP.
           </div>
         </>
       )}
@@ -923,7 +1018,6 @@ function TaskCard(props: {
   const t = props.t;
   const val = props.getTitleValue(t);
 
-  // auto-grow textarea without breaking input
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     const el = areaRef.current;
@@ -942,7 +1036,6 @@ function TaskCard(props: {
           rows={1}
           onChange={(e) => {
             const v = e.target.value;
-            // локальный draft (не пишем в БД на каждый символ)
             props.setDraftTitle((p) => ({ ...p, [t.id]: v }));
           }}
           onBlur={() => props.saveTitleToDb(t.id)}
@@ -989,9 +1082,13 @@ function TaskCard(props: {
           onClick={() => props.dnfTask(t.id)}
           style={styles.dnfBtn}
           disabled={t.status === "finish" || t.status === "dnf"}
-          title="DNF (штраф)"
+          title="DNF"
         >
           DNF
+        </button>
+
+        <button onClick={() => props.deleteTask(t.id)} style={styles.dangerBtn} title="Удалить задачу">
+          ×
         </button>
       </div>
 
@@ -1012,14 +1109,6 @@ function TaskCard(props: {
           <option value="pit">{sessionDot("pit")} {sessionLabel("pit")}</option>
           <option value="parc">{sessionDot("parc")} {sessionLabel("parc")}</option>
         </select>
-
-        <button
-          onClick={() => props.deleteTask(t.id)}
-          style={styles.dangerBtn}
-          title="Удалить задачу"
-        >
-          ×
-        </button>
       </div>
     </div>
   );
@@ -1066,8 +1155,8 @@ const styles: Record<string, any> = {
   gpCard: {
     borderRadius: 18,
     padding: 12,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(10,14,24,0.35)",
+    border: "1px solid rgba(42,53,80,0.78)",
+    background: "rgba(14,20,34,0.75)",
     boxShadow: "0 20px 60px rgba(0,0,0,0.35)",
     maxWidth: 320,
   },
@@ -1078,7 +1167,6 @@ const styles: Record<string, any> = {
   gpCountdownSmall: { opacity: 0.45, fontSize: 11 },
   gpErr: { marginTop: 8, opacity: 0.85, fontSize: 13, color: "#ffd6d6" },
   smallGhostBtn: {
-    marginTop: 10,
     padding: "8px 12px",
     borderRadius: 12,
     border: "1px solid rgba(255,255,255,0.14)",
@@ -1139,8 +1227,8 @@ const styles: Record<string, any> = {
   chip: {
     padding: "8px 12px",
     borderRadius: 999,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(10,14,24,0.35)",
+    border: "1px solid rgba(42,53,80,0.78)",
+    background: "rgba(14,20,34,0.75)",
     fontWeight: 900,
     fontSize: 13,
   },
@@ -1161,10 +1249,10 @@ const styles: Record<string, any> = {
   },
 
   column: {
-    borderRadius: 18,
+    borderRadius: 16,
     padding: 12,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(10,14,24,0.25)",
+    border: "1px solid rgba(42,53,80,0.78)",
+    background: "rgba(14,20,34,0.72)",
     minHeight: 220,
   },
   columnHeader: { marginBottom: 10 },
@@ -1175,7 +1263,7 @@ const styles: Record<string, any> = {
   empty: { opacity: 0.6, fontSize: 13, padding: 6 },
 
   card: {
-    background: "rgba(0,0,0,0.25)",
+    background: "rgba(6,8,14,0.85)",
     border: "1px solid rgba(255,255,255,0.14)",
     borderRadius: 16,
     padding: 12,
@@ -1275,8 +1363,8 @@ const styles: Record<string, any> = {
   },
 
   dangerBtn: {
-    padding: "10px 14px",
-    borderRadius: 14,
+    padding: "8px 12px",
+    borderRadius: 12,
     border: "1px solid rgba(255,255,255,0.14)",
     background: "rgba(42, 15, 15, 0.65)",
     color: "#ffd6d6",
@@ -1285,7 +1373,7 @@ const styles: Record<string, any> = {
     fontSize: 16,
   },
 
-  // calendar layout fixed widths (fix "shrinks")
+  // calendar layout (stable, not shrinking on month changes)
   calendarLayout: {
     display: "grid",
     gridTemplateColumns: "minmax(620px, 1fr) minmax(360px, 520px)",
@@ -1308,9 +1396,26 @@ const styles: Record<string, any> = {
     gap: 12,
   },
 
-  calendarHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
-  calTitle: { fontSize: 22, fontWeight: 900, display: "flex", gap: 10, alignItems: "center" },
-  calNav: { display: "flex", gap: 10, alignItems: "center" },
+  calendarHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+    width: "100%",
+    minWidth: 0,
+  },
+  calTitle: {
+    fontSize: 22,
+    fontWeight: 900,
+    display: "flex",
+    gap: 10,
+    alignItems: "center",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    minWidth: 0,
+  },
+  calNav: { display: "flex", gap: 10, alignItems: "center", flexShrink: 0 },
   navBtn: {
     padding: "8px 12px",
     borderRadius: 12,
@@ -1361,6 +1466,15 @@ const styles: Record<string, any> = {
     left: 10,
     bottom: 10,
   },
+  f1Dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+    background: "#ff4d4d",
+    position: "absolute",
+    right: 10,
+    bottom: 10,
+  },
 
   panelCard: {
     borderRadius: 18,
@@ -1369,7 +1483,8 @@ const styles: Record<string, any> = {
     background: "rgba(10,14,24,0.25)",
   },
   panelTitle: { fontSize: 22, fontWeight: 900, marginBottom: 10 },
-  panelSubTitle: { marginTop: 10, fontSize: 18, fontWeight: 900, opacity: 0.95 },
+  panelSubTitleRow: { display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginTop: 10 },
+  panelSubTitle: { fontSize: 18, fontWeight: 900, opacity: 0.95 },
 
   timeInput: {
     flex: 1,

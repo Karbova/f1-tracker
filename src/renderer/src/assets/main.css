@@ -6,8 +6,13 @@ body {
   justify-content: center;
   overflow-x: hidden;
   overflow-y: auto;
-  background-image: url('./wavy-lines.svg');
+  background-image:
+    linear-gradient(rgba(0,0,0,0.45), rgba(0,0,0,0.45)),
+    url("./wall .jpg");
   background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
   user-select: none;
 }
 
