@@ -10,7 +10,7 @@
     "build": "npm run typecheck && electron-vite build",
     "start": "electron-vite preview",
     "dist": "electron-builder",
-    "release": "electron-builder --win --publish always",
+    "release": "npm run build && electron-builder --win --publish always",
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
@@ -39,6 +39,14 @@
         "repo": "REPO"
       }
     ],
+    "appId": "com.yourname.f1tracker",
+    "productName": "F1 Tracker",
+    "publish": [
+      { "provider": "github" }
+    ],
+    "win": {
+      "target": "nsis"
+    },
     "win": {
       "target": [
         {
