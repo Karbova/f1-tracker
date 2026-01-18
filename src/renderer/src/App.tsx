@@ -2422,7 +2422,7 @@ const baseStyles: Record<string, any> = {
   },
   statsMeta: { opacity: 0.9 },
 
-  statsMiniTitle: { marginTop: 12, fontWeight: 900, fontSize: 13, opacity: 0.95 },
+  statsMiniTitle1: { marginTop: 12, fontWeight: 900, fontSize: 13, opacity: 0.95 },
 
   statsBars: { marginTop: 8, display: "flex", flexDirection: "column", gap: 8 },
 
