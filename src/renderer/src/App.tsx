@@ -12,6 +12,8 @@ type Task = {
   laps_done: number;
   deadline?: string | null; // YYYY-MM-DD
   points_total?: number | null;
+  finished_at?: string | null; // ISO (когда finish/dnf)
+  points_session_type?: SessionType | null;
 };
 
 type NextGp = {
@@ -458,7 +460,7 @@ export default function App() {
     };
 
     for (const t of tasks) {
-      const k = t.session_type;
+      const k = (t.points_session_type ?? t.session_type) as SessionType;
       bySession[k] = (bySession[k] ?? 0) + Number(t.points_total ?? 0);
     }
     return { total, bySession };
@@ -485,6 +487,66 @@ export default function App() {
     }
 
     return map;
+  }, [tasks]);
+
+  const stats = useMemo(() => {
+    const total = tasks.length;
+    const done = tasks.filter((t) => t.status === "finish").length;
+    const dnf = tasks.filter((t) => t.status === "dnf").length;
+    const closed = done + dnf;
+    const active = total - closed;
+
+    const pointsTotal = tasks.reduce((s, t) => s + Number(t.points_total ?? 0), 0);
+    const donePoints = tasks
+      .filter((t) => t.status === "finish" || t.status === "dnf")
+      .reduce((s, t) => s + Number(t.points_total ?? 0), 0);
+
+    const completionRate = total > 0 ? Math.round((closed / total) * 100) : 0;
+    const avgDonePoints = closed > 0 ? Math.round((donePoints / closed) * 10) / 10 : 0;
+
+    // просрочено (deadline < today) и не завершено
+    const today = toYMD(new Date());
+    const overdue = tasks.filter((t) => {
+      const isClosed = t.status === "finish" || t.status === "dnf";
+      if (isClosed) return false;
+      if (!t.deadline) return false;
+      return String(t.deadline) < today;
+    }).length;
+
+    // очки за последние 7 дней (если finished_at есть в БД)
+    const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+    const weekPoints = tasks
+      .filter((t) => t.finished_at && new Date(String(t.finished_at)).getTime() >= weekAgo)
+      .reduce((s, t) => s + Number(t.points_total ?? 0), 0);
+
+    // распределение по сессиям (по количеству активных)
+    const bySessionCount: Record<SessionType, number> = {
+      practice: 0,
+      qualifying: 0,
+      sprint: 0,
+      race: 0,
+      pit: 0,
+      parc: 0,
+    };
+    for (const t of tasks) {
+      const isClosed = t.status === "finish" || t.status === "dnf";
+      if (isClosed) continue; // считаем только активные
+      bySessionCount[t.session_type] = (bySessionCount[t.session_type] ?? 0) + 1;
+    }
+
+    return {
+      total,
+      active,
+      done,
+      dnf,
+      closed,
+      overdue,
+      pointsTotal,
+      weekPoints,
+      completionRate,
+      avgDonePoints,
+      bySessionCount,
+    };
   }, [tasks]);
 
   // -------- calendar state (SQLite) --------
@@ -1049,30 +1111,109 @@ export default function App() {
         {isTracker && (
           <>
             {/* Next GP widget (tracker) */}
-            <div style={styles.gpWrap}>
-              <div style={styles.gpCard}>
-                <div style={styles.gpTitle}>🗓️ Ближайший GP</div>
+            <div style={styles.widgetsRow}>
+            {/* Next GP widget */}
+            <div style={styles.gpCard}>
+              <div style={styles.gpTitle}>🗓️ Ближайший GP</div>
 
-                {gpError ? (
-                  <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
-                ) : nextGp ? (
-                  <>
-                    <div style={styles.gpName}>{nextGp.name}</div>
-                    <div style={styles.gpLoc}>{nextGp.location}</div>
-                    <div style={styles.gpCountdown}>
-                      ⏱️ {formatCountdown(nextGp.dateTimeISO)}{" "}
-                      <span style={styles.gpCountdownSmall}>({gpTick})</span>
-                    </div>
-                  </>
-                ) : (
-                  <div style={styles.gpErr}>Загрузка…</div>
-                )}
+              {gpError ? (
+                <div style={styles.gpErr}>Не удалось загрузить: {gpError}</div>
+              ) : nextGp ? (
+                <>
+                  <div style={styles.gpName}>{nextGp.name}</div>
+                  <div style={styles.gpLoc}>{nextGp.location}</div>
+                  <div style={styles.gpCountdown}>
+                    ⏱️ {formatCountdown(nextGp.dateTimeISO)} <span style={styles.gpCountdownSmall}>({gpTick})</span>
+                  </div>
+                </>
+              ) : (
+                <div style={styles.gpErr}>Загрузка…</div>
+              )}
 
-                <button style={styles.smallGhostBtn} onClick={fetchNextGp} type="button">
-                  Обновить
-                </button>
+              <button style={styles.smallGhostBtn} onClick={fetchNextGp} type="button">
+                Обновить
+              </button>
+            </div>
+
+            {/* Stats widget */}
+            <div style={styles.statsCard}>
+            <div style={styles.statsTitle}>📊 Статистика</div>
+
+            <div style={styles.statsLayout}>
+              {/* LEFT: numbers */}
+              <div style={styles.statsLeft}>
+                <div style={styles.statsGridMini}>
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>Всего</div>
+                    <div style={styles.statValue}>{stats.total}</div>
+                  </div>
+
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>Активные</div>
+                    <div style={styles.statValue}>{stats.active}</div>
+                  </div>
+
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>Завершено</div>
+                    <div style={styles.statValue}>{stats.done}</div>
+                  </div>
+
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>DNF</div>
+                    <div style={styles.statValue}>{stats.dnf}</div>
+                  </div>
+
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>Просрочено</div>
+                    <div style={styles.statValue}>{stats.overdue}</div>
+                  </div>
+
+                  <div style={styles.statBoxMini}>
+                    <div style={styles.statLabel}>Выполнение</div>
+                    <div style={styles.statValue}>{stats.completionRate}%</div>
+                  </div>
+                </div>
+
+                <div style={styles.statsRowMini}>
+                  <div style={styles.statsMeta}>🏆 {stats.pointsTotal}</div>
+                  <div style={styles.statsMeta}>🗓️ 7д: {stats.weekPoints}</div>
+                  <div style={styles.statsMeta}>⭐ {stats.avgDonePoints}</div>
+                </div>
+              </div>
+
+              {/* RIGHT: bars */}
+              <div style={styles.statsRight}>
+                <div style={styles.statsMiniTitle}>Активные по колонкам</div>
+
+                <div style={styles.statsBars}>
+                  {(["practice", "qualifying", "sprint", "race", "pit", "parc"] as SessionType[]).map((k) => {
+                    const n = stats.bySessionCount[k] ?? 0;
+                    const max = Math.max(1, ...Object.values(stats.bySessionCount).map((x) => Number(x || 0)));
+                    const w = Math.round((n / max) * 100);
+
+                    return (
+                      <div key={k} style={styles.barRowCompact}>
+                        <div style={styles.barLabelCompact}>
+                          {sessionDot(k)} {sessionLabel(k)}
+                        </div>
+                        <div style={styles.barTrack}>
+                          <div style={{ ...styles.barFill, width: `${w}%` }} />
+                        </div>
+                        <div style={styles.barNum}>{n}</div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             </div>
+
+              <div style={styles.statsRow}>
+                <div style={styles.statsMeta}>🏆 Очки всего: <b>{stats.pointsTotal}</b></div>
+                <div style={styles.statsMeta}>🗓️ За 7 дней: <b>{stats.weekPoints}</b></div>
+                <div style={styles.statsMeta}>⭐ Среднее за задачу: <b>{stats.avgDonePoints}</b></div>
+              </div>
+            </div>
+          </div>
 
             {/* add task row */}
             <div style={styles.row}>
@@ -1118,7 +1259,7 @@ export default function App() {
               <div style={styles.chip}>🔴 Sprint: {points.bySession.sprint}</div>
               <div style={styles.chip}>🏁 Race Day: {points.bySession.race}</div>
               <div style={styles.chip}>⬛ Pit Stop: {points.bySession.pit}</div>
-              <div style={styles.chip}>🔧 Parc Fermé: {points.bySession.parc}</div>
+              
               {loadingTasks && <div style={styles.chipMuted}>loading…</div>}
             </div>
 
@@ -1256,7 +1397,7 @@ export default function App() {
                 )}
               />
 
-              {showParc && (
+              {showParc ? (
                 <Column
                   title="Parc Fermé"
                   dot="🔧"
@@ -1280,6 +1421,15 @@ export default function App() {
                       deleteTask={deleteTask}
                     />
                   )}
+                />
+              ) : (
+                <div
+                  style={{
+                    ...styles.column,
+                    visibility: "hidden",
+                    pointerEvents: "none",
+                  }}
+                  aria-hidden="true"
                 />
               )}
             </div>
@@ -1709,7 +1859,10 @@ function TaskCard(props: {
 // ---------- styles (base) ----------
 const baseStyles: Record<string, any> = {
   app: {
+    width: "100vw",
+    minWidth: "100vw",
     height: "100vh",
+    overflowX: "hidden",
     overflowY: "auto",
     padding: 18,
     boxSizing: "border-box",
@@ -1834,10 +1987,18 @@ const baseStyles: Record<string, any> = {
     opacity: 0.7,
   },
 
+  trackerWrap: {
+    width: "100%",
+    maxWidth: 1400,      // любое стабильное значение
+    margin: "0 auto",
+  },
+
   grid: {
     display: "grid",
     gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
     gap: 12,
+    width: "100%",
+    minWidth: 0,
   },
 
   column: {
@@ -2157,6 +2318,125 @@ const baseStyles: Record<string, any> = {
     fontWeight: 900,
     fontSize: 20,
   },
+
+  widgetsRow: {
+    display: "flex",
+    gap: 12,
+    flexWrap: "wrap",
+    alignItems: "stretch",
+    marginBottom: 10,
+  },
+
+  statsCard: {
+    flex: 1,
+    minWidth: 360,     // было 320, но мы делаем компактнее по высоте, а ширина пусть держится
+    maxWidth: 720,     // ограничим, чтобы не раздувалось
+    borderRadius: 18,
+    padding: 12,
+    border: "1px solid rgba(42,53,80,0.78)",
+    background: "rgba(14,20,34,0.75)",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.35)",
+  },
+  
+  statsLayout: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1.1fr", // справа чуть шире под полоски
+    gap: 12,
+    marginTop: 10,
+    alignItems: "start",
+  },
+  
+  statsLeft: { minWidth: 0 },
+  statsRight: { minWidth: 0 },
+  
+  statsGridMini: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: 10,
+  },
+  
+  statBoxMini: {
+    borderRadius: 14,
+    padding: "8px 10px",
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "rgba(0,0,0,0.18)",
+  },
+  
+  statsRowMini: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    marginTop: 10,
+    fontSize: 12,
+    opacity: 0.95,
+  },
+  
+  statsMiniTitle: {
+    fontWeight: 900,
+    fontSize: 13,
+    opacity: 0.95,
+    marginBottom: 8,
+  },
+  
+  barRowCompact: {
+    display: "grid",
+    gridTemplateColumns: "140px 1fr 26px",
+    gap: 10,
+    alignItems: "center",
+  },
+  
+  barLabelCompact: {
+    fontSize: 12,
+    opacity: 0.9,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+
+  statsTitle: { fontSize: 16, fontWeight: 900, opacity: 0.95 },
+
+  statsGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: 10,
+    marginTop: 10,
+  },
+
+  statBox: {
+    borderRadius: 14,
+    padding: 10,
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "rgba(0,0,0,0.18)",
+  },
+
+  statLabel: { opacity: 0.75, fontSize: 12, fontWeight: 800 },
+  statValue: { marginTop: 4, fontSize: 18, fontWeight: 900 },
+
+  statsRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    marginTop: 10,
+    opacity: 0.95,
+    fontSize: 13,
+  },
+  statsMeta: { opacity: 0.9 },
+
+  statsMiniTitle: { marginTop: 12, fontWeight: 900, fontSize: 13, opacity: 0.95 },
+
+  statsBars: { marginTop: 8, display: "flex", flexDirection: "column", gap: 8 },
+
+  barRow: { display: "grid", gridTemplateColumns: "160px 1fr 28px", gap: 10, alignItems: "center" },
+  barLabel: { fontSize: 12, opacity: 0.9, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  barTrack: {
+    height: 10,
+    borderRadius: 999,
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "rgba(0,0,0,0.18)",
+    overflow: "hidden",
+  },
+  barFill: { height: "100%", borderRadius: 999, background: "rgba(247,201,72,0.85)" },
+  barNum: { textAlign: "right", fontSize: 12, opacity: 0.85, fontWeight: 900 },
 
   noteSmall: { marginTop: 10, opacity: 0.65, fontSize: 12 },
 

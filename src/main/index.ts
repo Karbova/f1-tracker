@@ -187,11 +187,14 @@ app.whenReady().then(() => {
     const info = db
       .prepare(
         `INSERT INTO tasks
-        (title, session_type, status, laps_total, laps_done, created_at, deadline,
-         points_base, points_bonus, points_penalty, points_total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0)`
+          (title, session_type, status, laps_total, laps_done, created_at, deadline,
+          points_session_type,
+          points_base, points_bonus, points_penalty, points_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?,
+                ?,
+                0, 0, 0, 0)`
       )
-      .run(title, session_type, status, laps_total, laps_done, now, deadline);
+      .run(title, session_type, status, laps_total, laps_done, now, deadline, session_type);
       const created = db.prepare("SELECT * FROM tasks WHERE id = ?").get(info.lastInsertRowid);
 scheduleDeadlineNotif(created);
 
@@ -224,6 +227,14 @@ scheduleDeadlineNotif(created);
     const status =
       payload?.status !== undefined ? String(payload.status) : current.status;
 
+    let pointsSessionType = current.points_session_type ?? current.session_type;
+
+      // если задача еще активная — меняем “категорию очков” вместе с колонкой
+    const doneNow = status === "finish" || status === "dnf";
+    if (!doneNow && payload?.session_type !== undefined) {
+        pointsSessionType = session_type;
+    }
+
     const laps_total =
       payload?.laps_total !== undefined
         ? clampInt(payload.laps_total, 1, 999)
@@ -239,7 +250,8 @@ scheduleDeadlineNotif(created);
 
     db.prepare(
       `UPDATE tasks
-       SET title = ?, session_type = ?, status = ?, laps_total = ?, laps_done = ?, deadline = ?
+       SET title = ?, session_type = ?, status = ?, laps_total = ?, laps_done = ?, deadline = ?,
+           points_session_type = ?
        WHERE id = ?`
     ).run(title, session_type, status, laps_total, laps_done, deadline, id);
     const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(payload.id);
@@ -253,6 +265,8 @@ scheduleDeadlineNotif(updated);
     if (!task) throw new Error("task not found");
 
     const finishedAt = toISO(new Date());
+
+    const scoreType = String(task.points_session_type || task.session_type); // ВАЖ
     const base = basePoints(String(task.session_type));
 
     let penalty = 0;
