@@ -248,12 +248,12 @@ scheduleDeadlineNotif(created);
     const deadline =
       payload?.deadline !== undefined ? payload.deadline : current.deadline;
 
-    db.prepare(
-      `UPDATE tasks
-       SET title = ?, session_type = ?, status = ?, laps_total = ?, laps_done = ?, deadline = ?,
-           points_session_type = ?
-       WHERE id = ?`
-    ).run(title, session_type, status, laps_total, laps_done, deadline, id);
+      db.prepare(
+        `UPDATE tasks
+         SET title = ?, session_type = ?, status = ?, laps_total = ?, laps_done = ?, deadline = ?,
+             points_session_type = ?
+         WHERE id = ?`
+      ).run(title, session_type, status, laps_total, laps_done, deadline, pointsSessionType, id);
     const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(payload.id);
 scheduleDeadlineNotif(updated);
 
@@ -266,9 +266,8 @@ scheduleDeadlineNotif(updated);
 
     const finishedAt = toISO(new Date());
 
-    const scoreType = String(task.points_session_type || task.session_type); // ВАЖ
-    const base = basePoints(String(task.session_type));
-
+    const scoreType = String(task.points_session_type || task.session_type); // категория очков
+    const base = basePoints(scoreType); // ✅ начисляем по категории очков, а не по session_type
     let penalty = 0;
     if (task.deadline) {
       const lateDays = isLateByDays(String(task.deadline), finishedAt);
