@@ -10,7 +10,12 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -25,7 +30,19 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Build & publish (Windows)
+      - name: Build (electron-vite)
+        run: npm run build
+
+      # ВАЖНО: чтобы на macOS electron-builder не требовал подпись (пока)
+      - name: Publish (macOS)
+        if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run release
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --publish always
+
+      - name: Publish (Windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --publish always
